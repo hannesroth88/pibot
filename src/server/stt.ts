@@ -1,20 +1,37 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { logStreamLines } from "./log-stream.js";
-import type { Logger } from "./logger.js";
 
 export interface SttServiceDeps {
 	workerPath: string;
-	logger: Logger;
-	broadcast: (data: object) => void;
-	enqueuePrompt: (text: string) => void;
-	performAbort: (reason: string, sttIndex?: number) => Promise<void>;
-	shouldIgnoreNonStopFinal: () => boolean;
+	onEvent?: (event: SttEvent) => void;
 }
 
 export interface SttService {
+	onEvent: (handler: (event: SttEvent) => void) => void;
 	handleAudioFrame: (data: Buffer) => void;
 	stopChildProcess: () => void;
 }
+
+export type SttEvent =
+	| { type: "loading" }
+	| {
+			type: "ready";
+			sampleRate: number;
+			vadChunkMs: number;
+			vadThreshold: number;
+			minSilenceMs: number;
+			prerollMs: number;
+			interimIntervalMs?: number;
+	  }
+	| { type: "worker_log"; line: string }
+	| { type: "worker_exit"; code: number | null; signal: string | null }
+	| { type: "parse_error"; line: string; message: string }
+	| { type: "speech_start"; index: number }
+	| { type: "speech_end"; index: number; duration: number }
+	| { type: "speech_drop"; index: number; duration: number; reason: string }
+	| { type: "interim"; index: number; text: string; audioMs: number; decodeMs: number }
+	| { type: "stop_detected"; index: number; text: string; source: "interim" | "final" }
+	| { type: "final"; index: number; text: string; decodeMs: number }
+	| { type: "error"; message: string };
 
 type SttWorkerMsg =
 	| {
@@ -34,15 +51,6 @@ type SttWorkerMsg =
 	| { type: "final"; index: number; text: string; duration: number; decodeMs: number }
 	| { type: "error"; message: string };
 
-function normalizeForStopMatch(text: string): string {
-	return text
-		.toLowerCase()
-		.normalize("NFKD")
-		.replace(/[.,!?;:()[\]{}"'`´]/g, " ")
-		.replace(/\s+/g, " ")
-		.trim();
-}
-
 const stopWordPhrases = [
 	"stop",
 	"stopp",
@@ -58,7 +66,12 @@ const stopWordPhrases = [
 ];
 
 function looksLikeStopCommand(text: string): boolean {
-	const normalized = normalizeForStopMatch(text);
+	const normalized = text
+		.toLowerCase()
+		.normalize("NFKD")
+		.replace(/[.,!?;:()[\]{}"'`´]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
 	if (!normalized) return false;
 	for (const phrase of stopWordPhrases) {
 		if (normalized === phrase) return true;
@@ -69,34 +82,51 @@ function looksLikeStopCommand(text: string): boolean {
 	return false;
 }
 
+function streamLines(stream: NodeJS.ReadableStream | null | undefined, onLine: (line: string) => void): void {
+	if (!stream) return;
+	let buffered = "";
+	stream.on("data", (chunk: Buffer | string) => {
+		buffered += chunk.toString();
+		while (true) {
+			const newline = buffered.indexOf("\n");
+			if (newline < 0) return;
+			const line = buffered.slice(0, newline).trim();
+			buffered = buffered.slice(newline + 1);
+			if (line) onLine(line);
+		}
+	});
+	stream.on("end", () => {
+		const line = buffered.trim();
+		buffered = "";
+		if (line) onLine(line);
+	});
+}
+
 export function createSttService(deps: SttServiceDeps): SttService {
 	let process: ChildProcess | undefined;
-	let ready = false;
-	let loadingAnnounced = false;
 	let stdout = "";
 	let stoppedUtteranceIndex: number | undefined;
-	const logger = deps.logger.tag("stt");
+	const eventHandlers: Array<(event: SttEvent) => void> = deps.onEvent ? [deps.onEvent] : [];
+	let latestLifecycleEvent: SttEvent | undefined;
+	const emit = (event: SttEvent) => {
+		if (event.type === "loading" || event.type === "ready" || event.type === "error") latestLifecycleEvent = event;
+		for (const handler of eventHandlers) handler(event);
+	};
 
 	function startWorker(): void {
 		if (process && !process.killed) return;
-		ready = false;
-		loadingAnnounced = false;
 		stdout = "";
-		logger.log("starting Parakeet STT worker via uvx");
+		emit({ type: "loading" });
 		const child = spawn("uvx", ["--with", "parakeet-mlx", "--with", "silero-vad", "python", deps.workerPath], {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		process = child;
 		child.stdout?.on("data", (data: Buffer) => handleStdout(data));
-		logStreamLines(child.stderr, logger);
-		child.once("error", (error) => {
-			deps.broadcast({ type: "stt_event", event: "error", message: error.message });
-			logger.log(`Parakeet worker failed to start: ${error.message}`);
-		});
+		streamLines(child.stderr, (line) => emit({ type: "worker_log", line }));
+		child.once("error", (error) => emit({ type: "error", message: error.message }));
 		child.once("exit", (code, signal) => {
 			if (process === child) process = undefined;
-			ready = false;
-			logger.log(`Parakeet worker exited code=${code ?? "none"} signal=${signal ?? "none"}`);
+			emit({ type: "worker_exit", code, signal });
 		});
 	}
 
@@ -111,105 +141,83 @@ export function createSttService(deps: SttServiceDeps): SttService {
 			try {
 				handleMessage(JSON.parse(line) as SttWorkerMsg);
 			} catch (error) {
-				logger.log(
-					`failed to parse worker line: ${line}; ${error instanceof Error ? error.message : String(error)}`,
-				);
+				emit({ type: "parse_error", line, message: error instanceof Error ? error.message : String(error) });
 			}
 		}
 	}
 
 	function handleMessage(message: SttWorkerMsg): void {
 		if (message.type === "ready") {
-			ready = true;
-			logger.log(
-				`Parakeet ready sampleRate=${message.sampleRate} vadChunkMs=${message.vadChunkMs} threshold=${message.vadThreshold} minSilenceMs=${message.minSilenceMs} prerollMs=${message.prerollMs} interimIntervalMs=${message.interimIntervalMs ?? "off"}`,
-			);
-			deps.broadcast({ type: "stt_event", event: "ready" });
+			emit({
+				type: "ready",
+				sampleRate: message.sampleRate,
+				vadChunkMs: message.vadChunkMs,
+				vadThreshold: message.vadThreshold,
+				minSilenceMs: message.minSilenceMs,
+				prerollMs: message.prerollMs,
+				interimIntervalMs: message.interimIntervalMs,
+			});
 			return;
 		}
 		if (message.type === "speech_start") {
 			stoppedUtteranceIndex = undefined;
-			logger.log(`speech_start #${message.index}`);
-			deps.broadcast({ type: "stt_event", event: "speech_start", index: message.index });
+			emit({ type: "speech_start", index: message.index });
 			return;
 		}
 		if (message.type === "speech_end") {
-			logger.log(`speech_end #${message.index} duration=${message.duration.toFixed(2)}s`);
-			deps.broadcast({ type: "stt_event", event: "speech_end", index: message.index });
+			emit({ type: "speech_end", index: message.index, duration: message.duration });
 			return;
 		}
 		if (message.type === "speech_drop") {
-			logger.log(`speech_drop #${message.index} reason=${message.reason} duration=${message.duration.toFixed(2)}s`);
-			deps.broadcast({ type: "stt_event", event: "speech_drop", index: message.index });
+			emit({ type: "speech_drop", index: message.index, duration: message.duration, reason: message.reason });
 			return;
 		}
 		if (message.type === "interim") {
 			const text = message.text.trim();
-			logger.log(
-				`interim #${message.index} audioMs=${message.audioMs} decodeMs=${message.decodeMs} text=${JSON.stringify(text)}`,
-			);
-			deps.broadcast({ type: "stt_interim", index: message.index, text });
+			emit({ type: "interim", index: message.index, text, audioMs: message.audioMs, decodeMs: message.decodeMs });
 			if (text && looksLikeStopCommand(text) && stoppedUtteranceIndex !== message.index) {
 				stoppedUtteranceIndex = message.index;
-				logger.log("stop-word detected in interim, aborting current turn");
-				void deps.performAbort(`interim stop word: ${text}`, message.index);
+				emit({ type: "stop_detected", index: message.index, text, source: "interim" });
 			}
 			return;
 		}
 		if (message.type === "final") {
 			const text = message.text.trim();
-			logger.log(`final #${message.index} decodeMs=${message.decodeMs} text=${JSON.stringify(text)}`);
 			if (!text) {
-				deps.broadcast({ type: "stt_final", index: message.index, text, accepted: false, ignoredReason: "empty" });
+				emit({ type: "final", index: message.index, text, decodeMs: message.decodeMs });
 				return;
 			}
-			if (stoppedUtteranceIndex === message.index) {
-				logger.log(`ignoring final #${message.index}; utterance already handled as stop`);
-				deps.broadcast({ type: "stt_final", index: message.index, text, accepted: false, ignoredReason: "stop" });
-				return;
-			}
+			if (stoppedUtteranceIndex === message.index) return;
 			if (looksLikeStopCommand(text)) {
 				stoppedUtteranceIndex = message.index;
-				logger.log("stop-word detected in final, aborting current turn");
-				deps.broadcast({ type: "stt_final", index: message.index, text, accepted: false, ignoredReason: "stop" });
-				void deps.performAbort(`stop word: ${text}`, message.index);
+				emit({ type: "stop_detected", index: message.index, text, source: "final" });
 				return;
 			}
-			if (deps.shouldIgnoreNonStopFinal()) {
-				logger.log(`ignoring non-stop final during/recently-after TTS: ${JSON.stringify(text)}`);
-				deps.broadcast({
-					type: "stt_final",
-					index: message.index,
-					text,
-					accepted: false,
-					ignoredReason: "tts_bleed",
-				});
-				return;
-			}
-			deps.broadcast({ type: "stt_final", index: message.index, text, accepted: true });
-			deps.enqueuePrompt(text);
+			emit({ type: "final", index: message.index, text, decodeMs: message.decodeMs });
 			return;
 		}
-		logger.log(`worker error: ${message.message}`);
-		deps.broadcast({ type: "stt_event", event: "error", message: message.message });
+		emit({ type: "error", message: message.message });
 	}
 
 	function handleAudioFrame(data: Buffer): void {
-		startWorker();
 		if (!process?.stdin || process.stdin.destroyed) return;
 		const header = Buffer.allocUnsafe(4);
 		header.writeUInt32LE(data.byteLength, 0);
 		process.stdin.write(header);
 		process.stdin.write(data);
-		if (!ready && !loadingAnnounced) {
-			loadingAnnounced = true;
-			deps.broadcast({ type: "stt_event", event: "loading" });
-		}
 	}
 
 	function stopChildProcess(): void {
 		process?.kill();
 	}
 
-	return { handleAudioFrame, stopChildProcess };
+	startWorker();
+	return {
+		onEvent: (handler) => {
+			eventHandlers.push(handler);
+			if (latestLifecycleEvent) handler(latestLifecycleEvent);
+		},
+		handleAudioFrame,
+		stopChildProcess,
+	};
 }

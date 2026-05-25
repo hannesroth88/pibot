@@ -1,48 +1,52 @@
 export type MotorCommand = "forward" | "turn_left" | "turn_left_degrees" | "stop";
 
-export type ClientLogLevel = "log" | "info" | "warn" | "error" | "debug" | "app";
+export type LogOrigin = "server" | "client";
+
+export interface LogEntry {
+	origin: LogOrigin;
+	sequence: number;
+	time: number;
+	tags: string[];
+	message: string;
+	formatted: string;
+}
 
 export interface ClientLogMsg {
 	type: "client_log";
-	level: ClientLogLevel;
+	tags: string[];
 	message: string;
 	time: number;
 }
 
-export type AgentMessageLike = {
-	role: string;
-	content?: unknown;
-};
-
-export type AgentEvent =
-	| { type: "message_start"; message: AgentMessageLike }
-	| { type: "message_update"; assistantMessageEvent?: { type: string; delta?: string } }
-	| { type: "message_end"; message: AgentMessageLike }
-	| { type: "tool_execution_start"; toolName: string; args: unknown }
-	| { type: "other"; eventType: string };
-
-export type SttEventName = "loading" | "ready" | "speech_start" | "speech_end" | "speech_drop" | "error";
+export type RobotState =
+	| { phase: "inactive" }
+	| { phase: "listening" }
+	| { phase: "hearing" }
+	| { phase: "thinking"; heardText?: string; assistantText: string }
+	| { phase: "tool"; name: string; args: unknown; assistantText: string }
+	| { phase: "speaking"; assistantText: string }
+	| { phase: "error"; message: string };
 
 export interface RobotRpcMap {
-	take_photo_request: {
+	take_photo: {
 		request: Record<string, never>;
 		response: { dataUrl: string };
 	};
-	motor_request: {
+	motor: {
 		request: { command: MotorCommand; durationMs: number; degrees?: number };
 		response: { ok: true } | { ok: false; error: string };
+	};
+	speak: {
+		request: { url: string; text: string };
+		response: { ok: true } | { ok: false; error: string };
+	};
+	cancel_speech: {
+		request: { reason: string };
+		response: { ok: true };
 	};
 }
 
 export type RobotRpcType = keyof RobotRpcMap;
-
-export type RobotExecuteRequest<T extends RobotRpcType = RobotRpcType> = {
-	[K in RobotRpcType]: {
-		type: K;
-		payload: RobotRpcMap[K]["request"];
-		timeoutMs?: number;
-	};
-}[T];
 
 export type RobotWireRequest<T extends RobotRpcType = RobotRpcType> = {
 	[K in RobotRpcType]: {
@@ -66,22 +70,9 @@ export type RobotWireResponse<T extends RobotRpcType = RobotRpcType> = {
 }[T];
 
 export type ServerMessage =
-	| { type: "hello" }
-	| { type: "error"; message: string }
-	| { type: "speak_request"; id: string; text: string }
-	| { type: "cancel_speech"; reason: string; sttIndex?: number }
-	| { type: "stt_event"; event: SttEventName; index?: number; message?: string }
-	| { type: "stt_interim"; index: number; text: string }
-	| { type: "stt_final"; index: number; text: string; accepted: boolean; ignoredReason?: string }
-	| { type: "session_reset" }
-	| { type: "agent_event"; event: AgentEvent }
+	| { type: "hello"; state: RobotState }
+	| { type: "state"; state: RobotState }
+	| { type: "log"; entry: LogEntry }
 	| RobotWireRequest;
 
-export type ClientMessage =
-	| { type: "prompt"; text: string }
-	| { type: "speak_done"; id: string }
-	| { type: "speak_cancelled"; id: string }
-	| ClientLogMsg
-	| { type: "abort" }
-	| { type: "reset_session" }
-	| RobotWireResponse;
+export type ClientMessage = ClientLogMsg | { type: "abort" } | { type: "reset_session" } | RobotWireResponse;

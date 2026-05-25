@@ -1,33 +1,57 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import type { ServerResponse } from "node:http";
 import { createConnection } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
-import { WebSocket } from "ws";
-import { logStreamLines } from "./log-stream.js";
-import type { Logger } from "./logger.js";
+import { createEventEmitter, type EventSource } from "./events.js";
 
 type TtsProvider = "elevenlabs" | "pocket";
 
-type ServerToClientMsg = { type: "cancel_speech"; reason: string; sttIndex?: number };
+export type TtsEvent =
+	| { type: "speech_registered"; id: string; chars: number }
+	| { type: "speech_resolved"; id: string }
+	| { type: "pocket_starting"; command: string }
+	| { type: "pocket_ready"; url: string }
+	| { type: "pocket_log"; line: string }
+	| { type: "pocket_error"; message: string }
+	| { type: "pocket_exit"; code: number | null; signal: string | null }
+	| { type: "elevenlabs_voice_lookup_failed"; message: string };
 
 export interface TtsServiceDeps {
-	logger: Logger;
-	getRobotClient: () => WebSocket | undefined;
+	onEvent?: (event: TtsEvent) => void | Promise<void>;
 }
 
-export interface TtsService {
-	handleTtsRequest: (text: string, providerValue: string | undefined, res: ServerResponse) => Promise<void>;
-	speakOnClient: (text: string) => Promise<void>;
+export interface TtsService extends EventSource<TtsEvent> {
+	fetchTtsAudio: (
+		id: string,
+		providerValue: string | undefined,
+	) => Promise<{ response: Response; contentType: string }>;
+	registerSpeech: (text: string) => { id: string; url: string } | undefined;
 	resolveSpeech: (id: string) => void;
-	resolveSpeechForClient: (client: WebSocket) => void;
 	resolveAllSpeech: () => void;
-	cancelSpeechOnClients: (reason: string, sttIndex?: number) => void;
-	shouldIgnoreNonStopSttAsTtsBleed: () => boolean;
 	stopChildProcess: () => void;
 }
 
-export function createTtsService(deps: TtsServiceDeps): TtsService {
+function streamLines(stream: NodeJS.ReadableStream | null | undefined, onLine: (line: string) => void): void {
+	if (!stream) return;
+	let buffered = "";
+	stream.on("data", (chunk: Buffer | string) => {
+		buffered += chunk.toString();
+		while (true) {
+			const newline = buffered.indexOf("\n");
+			if (newline < 0) return;
+			const line = buffered.slice(0, newline).trim();
+			buffered = buffered.slice(newline + 1);
+			if (line) onLine(line);
+		}
+	});
+	stream.on("end", () => {
+		const line = buffered.trim();
+		buffered = "";
+		if (line) onLine(line);
+	});
+}
+
+export function createTtsService(deps: TtsServiceDeps = {}): TtsService {
 	const pocketTtsPort = Number(process.env.POCKET_TTS_PORT ?? 8020);
 	const pocketTtsBindHost = process.env.POCKET_TTS_BIND_HOST ?? "127.0.0.1";
 	const pocketTtsLanguage = process.env.POCKET_TTS_LANGUAGE ?? "german";
@@ -39,25 +63,11 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 	const elevenLabsModelId = process.env.ELEVENLABS_MODEL_ID ?? "eleven_v3";
 	const defaultTtsProvider = process.env.TTS_PROVIDER ?? "elevenlabs";
 
-	const pendingSpeech = new Map<string, { client: WebSocket; resolve: () => void; timeout: NodeJS.Timeout }>();
+	const events = createEventEmitter<TtsEvent>(deps.onEvent ? [deps.onEvent] : []);
+	const pendingSpeech = new Map<string, { text: string }>();
 	let pocketTtsProcess: ChildProcess | undefined;
 	let pocketTtsStartPromise: Promise<void> | undefined;
 	let pocketTtsLastError: Error | undefined;
-	let lastSpeechResolvedAt = 0;
-	const logger = deps.logger.tag("tts");
-
-	function sendToClient(client: WebSocket | undefined, data: ServerToClientMsg): void {
-		if (!client || client.readyState !== WebSocket.OPEN) return;
-		client.send(JSON.stringify(data));
-	}
-
-	function cancelSpeechOnClients(reason: string, sttIndex?: number): void {
-		const targets = new Set<WebSocket>();
-		const robotClient = deps.getRobotClient();
-		if (robotClient) targets.add(robotClient);
-		for (const pending of pendingSpeech.values()) targets.add(pending.client);
-		for (const client of targets) sendToClient(client, { type: "cancel_speech", reason, sttIndex });
-	}
 
 	function pocketTtsEndpoint(): { host: string; port: number } {
 		const url = new URL(pocketTtsUrl);
@@ -83,9 +93,8 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 	function startPocketTtsProcess(): void {
 		if (pocketTtsProcess && !pocketTtsProcess.killed) return;
 		pocketTtsLastError = undefined;
-		logger.log(
-			`starting Pocket TTS: uvx pocket-tts serve --language ${pocketTtsLanguage} --host ${pocketTtsBindHost} --port ${pocketTtsPort}`,
-		);
+		const command = `uvx pocket-tts serve --language ${pocketTtsLanguage} --host ${pocketTtsBindHost} --port ${pocketTtsPort}`;
+		events.emit({ type: "pocket_starting", command });
 		const child = spawn(
 			"uvx",
 			[
@@ -101,15 +110,15 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 			{ stdio: ["ignore", "pipe", "pipe"] },
 		);
 		pocketTtsProcess = child;
-		logStreamLines(child.stdout, logger.tag("pocket"));
-		logStreamLines(child.stderr, logger.tag("pocket"));
+		streamLines(child.stdout, (line) => events.emit({ type: "pocket_log", line }));
+		streamLines(child.stderr, (line) => events.emit({ type: "pocket_log", line }));
 		child.once("error", (error) => {
 			pocketTtsLastError = error;
-			logger.log(`Pocket TTS failed to start: ${error.message}`);
+			events.emit({ type: "pocket_error", message: error.message });
 		});
 		child.once("exit", (code, signal) => {
 			if (pocketTtsProcess === child) pocketTtsProcess = undefined;
-			if (code !== 0) logger.log(`Pocket TTS exited code=${code ?? "none"} signal=${signal ?? "none"}`);
+			if (code !== 0) events.emit({ type: "pocket_exit", code, signal });
 		});
 	}
 
@@ -121,7 +130,7 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 			while (Date.now() < deadline) {
 				if (pocketTtsLastError) throw pocketTtsLastError;
 				if (await canConnectToPocketTts()) {
-					logger.log(`Pocket TTS ready at ${pocketTtsUrl}`);
+					events.emit({ type: "pocket_ready", url: pocketTtsUrl });
 					return;
 				}
 				await sleep(500);
@@ -135,9 +144,10 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 		}
 	}
 
-	function normalizeTtsProvider(value: string | undefined): TtsProvider {
-		if (value === "pocket" || value === "kyutai") return "pocket";
-		return "elevenlabs";
+	function parseTtsProvider(value: string | undefined): TtsProvider {
+		if (value === undefined || value === "elevenlabs") return "elevenlabs";
+		if (value === "pocket") return "pocket";
+		throw new Error(`Unknown TTS provider: ${value}`);
 	}
 
 	async function resolveElevenLabsVoiceId(): Promise<string> {
@@ -151,45 +161,24 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 			const voice = data.voices?.find((entry) => entry.name === elevenLabsVoiceName);
 			return voice?.voice_id ?? elevenLabsVoiceId;
 		} catch (error) {
-			logger.log(`ElevenLabs voice lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+			events.emit({
+				type: "elevenlabs_voice_lookup_failed",
+				message: error instanceof Error ? error.message : String(error),
+			});
 			return elevenLabsVoiceId;
 		}
 	}
 
-	async function proxyAudioResponse(
-		response: Response,
-		res: ServerResponse,
-		fallbackContentType: string,
-	): Promise<void> {
-		if (!response.ok || !response.body) {
-			res.writeHead(response.status || 502, { "content-type": "application/json" });
-			res.end(JSON.stringify({ error: await response.text() }));
-			return;
-		}
-		res.writeHead(200, {
-			"content-type": response.headers.get("content-type") ?? fallbackContentType,
-			"cache-control": "no-store",
-		});
-		for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
-			res.write(chunk);
-		}
-		res.end();
-	}
-
-	async function handlePocketTtsRequest(text: string, res: ServerResponse): Promise<void> {
+	async function fetchPocketTts(text: string): Promise<{ response: Response; contentType: string }> {
 		await ensurePocketTtsStarted();
 		const form = new FormData();
 		form.set("text", text);
 		form.set("voice_url", pocketTtsVoice);
-		await proxyAudioResponse(await fetch(pocketTtsUrl, { method: "POST", body: form }), res, "audio/wav");
+		return { response: await fetch(pocketTtsUrl, { method: "POST", body: form }), contentType: "audio/wav" };
 	}
 
-	async function handleElevenLabsTtsRequest(text: string, res: ServerResponse): Promise<void> {
-		if (!elevenLabsApiKey) {
-			res.writeHead(503, { "content-type": "application/json" });
-			res.end(JSON.stringify({ error: "ELEVENLABS_API_KEY missing" }));
-			return;
-		}
+	async function fetchElevenLabsTts(text: string): Promise<{ response: Response; contentType: string }> {
+		if (!elevenLabsApiKey) throw new Error("ELEVENLABS_API_KEY missing");
 		const voiceId = await resolveElevenLabsVoiceId();
 		const response = await fetch(
 			`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=mp3_44100_128`,
@@ -203,65 +192,35 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 				body: JSON.stringify({ text, model_id: elevenLabsModelId }),
 			},
 		);
-		await proxyAudioResponse(response, res, "audio/mpeg");
+		return { response, contentType: "audio/mpeg" };
 	}
 
-	async function handleTtsRequest(
-		text: string,
+	async function fetchTts(
+		id: string,
 		providerValue: string | undefined,
-		res: ServerResponse,
-	): Promise<void> {
-		const trimmed = text.trim();
-		if (!trimmed) {
-			res.writeHead(400, { "content-type": "application/json" });
-			res.end(JSON.stringify({ error: "text required" }));
-			return;
-		}
-		const provider = normalizeTtsProvider(providerValue ?? defaultTtsProvider);
-		res.setHeader("x-pibot-tts-provider", provider);
-		if (provider === "pocket") await handlePocketTtsRequest(trimmed, res);
-		else await handleElevenLabsTtsRequest(trimmed, res);
+	): Promise<{ response: Response; contentType: string }> {
+		const pending = pendingSpeech.get(id);
+		if (!pending) throw new Error("speech not found");
+		const provider = parseTtsProvider(providerValue ?? defaultTtsProvider);
+		return provider === "pocket" ? await fetchPocketTts(pending.text) : await fetchElevenLabsTts(pending.text);
 	}
 
 	function resolveSpeech(id: string): void {
-		const pending = pendingSpeech.get(id);
-		if (!pending) return;
-		logger.log(`speech resolved id=${id}`);
-		lastSpeechResolvedAt = Date.now();
-		clearTimeout(pending.timeout);
-		pendingSpeech.delete(id);
-		pending.resolve();
-	}
-
-	function resolveSpeechForClient(client: WebSocket): void {
-		for (const [id, pending] of pendingSpeech) {
-			if (pending.client === client) resolveSpeech(id);
-		}
+		if (!pendingSpeech.delete(id)) return;
+		events.emit({ type: "speech_resolved", id });
 	}
 
 	function resolveAllSpeech(): void {
 		for (const id of pendingSpeech.keys()) resolveSpeech(id);
 	}
 
-	async function speakOnClient(text: string): Promise<void> {
-		const client = deps.getRobotClient();
-		if (!client || client.readyState !== WebSocket.OPEN) {
-			logger.log("no robot client connected for speech");
-			return;
-		}
+	function registerSpeech(text: string): { id: string; url: string } | undefined {
 		const trimmed = text.trim();
-		if (!trimmed) return;
+		if (!trimmed) return undefined;
 		const id = randomUUID();
-		logger.log(`speak_request id=${id} chars=${trimmed.length}`);
-		client.send(JSON.stringify({ type: "speak_request", id, text: trimmed }));
-		await new Promise<void>((resolve) => {
-			const timeout = setTimeout(() => resolveSpeech(id), 30000);
-			pendingSpeech.set(id, { client, resolve, timeout });
-		});
-	}
-
-	function shouldIgnoreNonStopSttAsTtsBleed(): boolean {
-		return pendingSpeech.size > 0 || Date.now() - lastSpeechResolvedAt < 1500;
+		pendingSpeech.set(id, { text: trimmed });
+		events.emit({ type: "speech_registered", id, chars: trimmed.length });
+		return { id, url: `/api/tts?id=${encodeURIComponent(id)}` };
 	}
 
 	function stopChildProcess(): void {
@@ -269,13 +228,11 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 	}
 
 	return {
-		handleTtsRequest,
-		speakOnClient,
+		onEvent: events.onEvent,
+		fetchTtsAudio: fetchTts,
+		registerSpeech,
 		resolveSpeech,
-		resolveSpeechForClient,
 		resolveAllSpeech,
-		cancelSpeechOnClients,
-		shouldIgnoreNonStopSttAsTtsBleed,
 		stopChildProcess,
 	};
 }

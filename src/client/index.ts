@@ -1,21 +1,14 @@
-import type { AgentMessageLike, MotorCommand, RobotRpcMap, RobotWireRequest, ServerMessage } from "../types.js";
+import type { MotorCommand, RobotRpcMap, RobotState, RobotWireRequest, ServerMessage } from "../types.js";
 
-type ConversationPhase = "idle" | "listening" | "thinking" | "speaking";
-type RobotFaceState = "idle" | "listening" | "hearing" | "thinking" | "speaking" | "tool" | "error";
+type ConversationPhase = "inactive" | "listening" | "thinking" | "speaking";
+type RobotFaceState = "inactive" | "listening" | "hearing" | "thinking" | "speaking" | "tool" | "error";
 
 const setup = document.querySelector<HTMLElement>("#setup");
 const robot = document.querySelector<HTMLElement>("#robot");
 const logEl = document.querySelector<HTMLElement>("#log");
 const face = document.querySelector<HTMLElement>("#face");
-const promptInput = document.querySelector<HTMLInputElement>("#prompt");
-const sendButton = document.querySelector<HTMLButtonElement>("#send");
-const robotModeButton = document.querySelector<HTMLButtonElement>("#robotMode");
 const backButton = document.querySelector<HTMLButtonElement>("#back");
-const micButton = document.querySelector<HTMLButtonElement>("#mic");
-const stopMicButton = document.querySelector<HTMLButtonElement>("#stopMic");
 const ttsProviderSelect = document.querySelector<HTMLSelectElement>("#ttsProvider");
-const testTtsButton = document.querySelector<HTMLButtonElement>("#testTts");
-const enableCameraButton = document.querySelector<HTMLButtonElement>("#enableCamera");
 const startAllButton = document.querySelector<HTMLButtonElement>("#startAll");
 const resetSessionButton = document.querySelector<HTMLButtonElement>("#resetSession");
 const gyroStatusEl = document.querySelector<HTMLElement>("#gyroStatus");
@@ -25,15 +18,8 @@ if (
 	!robot ||
 	!logEl ||
 	!face ||
-	!promptInput ||
-	!sendButton ||
-	!robotModeButton ||
 	!backButton ||
-	!micButton ||
-	!stopMicButton ||
 	!ttsProviderSelect ||
-	!testTtsButton ||
-	!enableCameraButton ||
 	!startAllButton ||
 	!resetSessionButton ||
 	!gyroStatusEl
@@ -58,10 +44,10 @@ let micStream: MediaStream | undefined;
 let micAudioContext: AudioContext | undefined;
 let micSource: MediaStreamAudioSourceNode | undefined;
 let micProcessor: ScriptProcessorNode | undefined;
-let assistantSpeechBuffer = "";
 let ttsEnabled = localStorage.getItem(ttsEnabledKey) === "true";
-let phase: ConversationPhase = "idle";
-let currentFaceState: RobotFaceState = "idle";
+let phase: ConversationPhase = "inactive";
+let serverRobotState: RobotState = { phase: "inactive" };
+let currentFaceState: RobotFaceState = "inactive";
 let ignoreMicUntil = 0;
 let currentTtsAudio: HTMLAudioElement | undefined;
 let robotVoiceEffectCleanup: (() => void) | undefined;
@@ -69,15 +55,12 @@ let audioContext: AudioContext | undefined;
 let ttsGeneration = 0;
 let activeSpeakRequestId: string | undefined;
 let ttsSpeaking = false;
-let sttSpeechActive = false;
-let currentSttIndex: number | undefined;
-let ignoredSttIndex: number | undefined;
-let toolActiveUntil = 0;
 let errorUntil = 0;
 let cameraStream: MediaStream | undefined;
 let cameraVideo: HTMLVideoElement | undefined;
 const cameraEnabledKey = "robot-camera-enabled";
 let cameraEnabled = localStorage.getItem(cameraEnabledKey) === "true";
+let robotStarted = false;
 ttsProviderControl.value = localStorage.getItem(ttsProviderKey) ?? "elevenlabs";
 
 function stringifyLogValue(value: unknown): string {
@@ -90,60 +73,65 @@ function stringifyLogValue(value: unknown): string {
 	}
 }
 
-function sendClientLog(level: "log" | "info" | "warn" | "error" | "debug" | "app", message: string): void {
-	const payload = {
-		type: "client_log",
-		level,
-		message: message.slice(0, 4000),
-		time: Date.now(),
-	};
-	const body = JSON.stringify(payload);
-	if (ws.readyState === WebSocket.OPEN) {
-		ws.send(body);
-		return;
-	}
-	if (navigator.sendBeacon) {
-		navigator.sendBeacon("/api/client-log", new Blob([body], { type: "application/json" }));
-		return;
-	}
-	void fetch("/api/client-log", {
-		method: "POST",
-		body,
-		headers: { "content-type": "application/json" },
-		keepalive: true,
-	});
-}
+class ClientLogger {
+	constructor(private readonly tags: string[] = []) {}
 
-function installClientLogForwarding(): void {
-	for (const level of ["log", "info", "warn", "error", "debug"] as const) {
-		const original = console[level].bind(console);
-		console[level] = (...args: unknown[]) => {
-			original(...args);
-			sendClientLog(level, args.map(stringifyLogValue).join(" "));
+	tag(tag: string): ClientLogger {
+		return new ClientLogger([...this.tags, tag]);
+	}
+
+	log(message: string): void {
+		const payload = {
+			type: "client_log",
+			tags: this.tags,
+			message: message.slice(0, 4000),
+			time: Date.now(),
 		};
+		const body = JSON.stringify(payload);
+		if (ws.readyState === WebSocket.OPEN) ws.send(body);
 	}
-	window.addEventListener("error", (event) => {
-		sendClientLog("error", `window error: ${event.message} at ${event.filename}:${event.lineno}:${event.colno}`);
-	});
-	window.addEventListener("unhandledrejection", (event) => {
-		sendClientLog("error", `unhandled rejection: ${stringifyLogValue(event.reason)}`);
-	});
 }
 
-installClientLogForwarding();
+const clientLogger = new ClientLogger();
 
-function log(text: string, className = ""): void {
+window.addEventListener("error", (event) => {
+	clientLogger.tag("error").log(`window error: ${event.message} at ${event.filename}:${event.lineno}:${event.colno}`);
+});
+window.addEventListener("unhandledrejection", (event) => {
+	clientLogger.tag("error").log(`unhandled rejection: ${stringifyLogValue(event.reason)}`);
+});
+
+const tagColors = ["#45d9ff", "#d783ff", "#ffd166", "#6ee7a8", "#7aa2ff", "#ff6b7a", "#9ca3af"];
+
+function tagColor(tag: string): string {
+	let hash = 0;
+	for (let i = 0; i < tag.length; i++) hash = (hash * 31 + tag.charCodeAt(i)) | 0;
+	return tagColors[Math.abs(hash) % tagColors.length]!;
+}
+
+function appendStructuredLogLine(origin: "server" | "client", tags: string[], message: string): void {
 	const line = document.createElement("div");
-	line.textContent = `${new Date().toLocaleTimeString()} ${text}`;
-	if (className) line.className = className;
+	const displayTags = [origin, ...tags.filter((tag, index) => index !== 0 || tag !== origin)];
+	line.append(`${new Date().toLocaleTimeString()} `);
+	for (const tag of displayTags) {
+		const span = document.createElement("span");
+		span.textContent = `[${tag}]`;
+		span.style.color = tagColor(tag);
+		line.append(span);
+	}
+	line.append(` ${message}`);
+	line.className = displayTags.join(" ");
 	logOutput.append(line);
 	logOutput.scrollTop = logOutput.scrollHeight;
-	console.info(`[app] ${text}`);
+}
+
+function log(text: string, tag = ""): void {
+	(tag ? clientLogger.tag(tag) : clientLogger).log(text);
 }
 
 function send(data: unknown): void {
 	if (ws.readyState !== WebSocket.OPEN) {
-		sendClientLog("warn", `WebSocket not open; dropping message ${JSON.stringify(data).slice(0, 500)}`);
+		clientLogger.tag("warn").log(`WebSocket not open; dropping message ${JSON.stringify(data).slice(0, 500)}`);
 		return;
 	}
 	ws.send(JSON.stringify(data));
@@ -151,12 +139,8 @@ function send(data: unknown): void {
 
 function deriveRobotFaceState(): RobotFaceState {
 	if (Date.now() < errorUntil) return "error";
-	if (ttsSpeaking) return "speaking";
-	if (sttSpeechActive && currentSttIndex !== ignoredSttIndex) return "hearing";
-	if (Date.now() < toolActiveUntil) return "tool";
-	if (phase === "thinking") return "thinking";
-	if (recognitionWanted) return "listening";
-	return "idle";
+	if (serverRobotState.phase === "speaking" || ttsSpeaking) return "speaking";
+	return serverRobotState.phase;
 }
 
 function renderRobotFace(): void {
@@ -164,12 +148,6 @@ function renderRobotFace(): void {
 	if (next === currentFaceState) return;
 	currentFaceState = next;
 	robotFace.className = `face ${next}`;
-}
-
-function showToolFor(durationMs: number): void {
-	toolActiveUntil = Math.max(toolActiveUntil, Date.now() + Math.max(250, durationMs));
-	renderRobotFace();
-	setTimeout(renderRobotFace, Math.max(250, durationMs) + 20);
 }
 
 function showErrorFor(durationMs: number): void {
@@ -337,7 +315,7 @@ async function ftWritePins(value: number): Promise<void> {
 async function connectFt232h(promptIfMissing: boolean): Promise<boolean> {
 	const usb = navigator.usb;
 	if (!usb) {
-		log("WebUSB unavailable; motors cannot run", "agent");
+		log("WebUSB unavailable; motors cannot run", "hardware");
 		return false;
 	}
 	try {
@@ -363,7 +341,7 @@ async function connectFt232h(promptIfMissing: boolean): Promise<boolean> {
 							.join(",")}`,
 				)
 				.join(" | ")}`,
-			"agent",
+			"hardware",
 		);
 
 		const claimedInterfaceNumber = interfaces[0]?.interfaceNumber ?? 0;
@@ -380,13 +358,13 @@ async function connectFt232h(promptIfMissing: boolean): Promise<boolean> {
 		ftConnected = true;
 		log(
 			`FT232H connected: ${device.productName ?? "FT232H"} interface=${claimedInterfaceNumber} ep=${ftOutEndpoint}`,
-			"agent",
+			"hardware",
 		);
 		return true;
 	} catch (error) {
 		ftDevice = undefined;
 		ftConnected = false;
-		log(`FT232H connect failed: ${error instanceof Error ? error.message : String(error)}`, "agent");
+		log(`FT232H connect failed: ${error instanceof Error ? error.message : String(error)}`, "hardware");
 		return false;
 	}
 }
@@ -434,7 +412,7 @@ function handleOrientation(event: DeviceOrientationEvent): void {
 async function startOrientationTracking(): Promise<boolean> {
 	if (orientationTracking) return true;
 	if (!("DeviceOrientationEvent" in window)) {
-		log("Device orientation unavailable; degree turns disabled", "agent");
+		log("Device orientation unavailable; degree turns disabled", "orientation");
 		return false;
 	}
 	const orientationCtor = DeviceOrientationEvent as unknown as {
@@ -443,7 +421,7 @@ async function startOrientationTracking(): Promise<boolean> {
 	if (orientationCtor.requestPermission) {
 		const permission = await orientationCtor.requestPermission();
 		if (permission !== "granted") {
-			log(`Device orientation permission not granted: ${permission}`, "agent");
+			log(`Device orientation permission not granted: ${permission}`, "orientation");
 			return false;
 		}
 	}
@@ -453,7 +431,7 @@ async function startOrientationTracking(): Promise<boolean> {
 	await waitForHeading(1200);
 	log(
 		`Orientation tracking ${currentHeading === undefined ? "started without heading yet" : `heading=${currentHeading.toFixed(1)}°`}`,
-		"agent",
+		"orientation",
 	);
 	return true;
 }
@@ -561,7 +539,7 @@ async function turnLeftByDegrees(degrees: number, maxDurationMs: number, generat
 	log(`gyro turn_left_degrees target=${targetDegrees.toFixed(1)}° actual≈${turned.toFixed(1)}°`, "robot");
 }
 
-type MotorRequestPayload = RobotRpcMap["motor_request"]["request"];
+type MotorRequestPayload = RobotRpcMap["motor"]["request"];
 
 async function handleMotorRequest(id: string, payload: MotorRequestPayload): Promise<void> {
 	const { command, durationMs, degrees } = payload;
@@ -574,7 +552,7 @@ async function handleMotorRequest(id: string, payload: MotorRequestPayload): Pro
 		send({
 			type: "robot_response",
 			id,
-			requestType: "motor_request",
+			requestType: "motor",
 			payload: { ok: false, error: "FT232H not connected" },
 		});
 		return;
@@ -582,7 +560,7 @@ async function handleMotorRequest(id: string, payload: MotorRequestPayload): Pro
 	try {
 		if (command === "turn_left_degrees") {
 			await turnLeftByDegrees(Number(degrees ?? 45), durationMs, generation);
-			send({ type: "robot_response", id, requestType: "motor_request", payload: { ok: true } });
+			send({ type: "robot_response", id, requestType: "motor", payload: { ok: true } });
 			return;
 		}
 		const pins = motorCommandPins(command);
@@ -595,17 +573,17 @@ async function handleMotorRequest(id: string, payload: MotorRequestPayload): Pro
 					try {
 						await stopMotorPins();
 					} catch (error) {
-						log(`motor stop failed: ${error instanceof Error ? error.message : String(error)}`, "agent");
+						log(`motor stop failed: ${error instanceof Error ? error.message : String(error)}`, "hardware");
 					}
 					resolve();
 				}, durationMs);
 			});
 		}
-		send({ type: "robot_response", id, requestType: "motor_request", payload: { ok: true } });
+		send({ type: "robot_response", id, requestType: "motor", payload: { ok: true } });
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		log(`motor request failed: ${message}`, "agent");
-		send({ type: "robot_response", id, requestType: "motor_request", payload: { ok: false, error: message } });
+		log(`motor request failed: ${message}`, "hardware");
+		send({ type: "robot_response", id, requestType: "motor", payload: { ok: false, error: message } });
 		try {
 			await stopMotorPins();
 		} catch {
@@ -626,23 +604,33 @@ window.addEventListener("beforeunload", () => {
 async function handlePhotoRequest(id: string): Promise<void> {
 	try {
 		const dataUrl = await capturePhotoDataUrl();
-		send({ type: "robot_response", id, requestType: "take_photo_request", payload: { dataUrl } });
-		log(`Captured photo for tool request ${id} (${dataUrl.length} chars)`, "agent");
+		send({ type: "robot_response", id, requestType: "take_photo", payload: { dataUrl } });
+		log(`Captured photo for tool request ${id} (${dataUrl.length} chars)`, "camera");
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		send({ type: "robot_response", id, requestType: "take_photo_request", error: message });
-		log(`Photo capture failed: ${message}`, "agent");
+		send({ type: "robot_response", id, requestType: "take_photo", error: message });
+		log(`Photo capture failed: ${message}`, "camera");
 	}
 }
 
 async function handleRobotRequest(message: RobotWireRequest): Promise<void> {
-	if (message.request.type === "take_photo_request") {
-		log(`photo requested ${message.id}`, "agent");
+	if (message.request.type === "take_photo") {
+		log(`photo requested ${message.id}`, "camera");
 		await handlePhotoRequest(message.id);
 		return;
 	}
-	if (message.request.type === "motor_request") {
+	if (message.request.type === "motor") {
 		await handleMotorRequest(message.id, message.request.payload);
+		return;
+	}
+	if (message.request.type === "speak") {
+		if (ttsEnabled) speakGerman(message.request.payload.url, message.request.payload.text, message.id);
+		else send({ type: "robot_response", id: message.id, requestType: "speak", payload: { ok: true } });
+		return;
+	}
+	if (message.request.type === "cancel_speech") {
+		cancelSpeech(message.request.payload.reason);
+		send({ type: "robot_response", id: message.id, requestType: "cancel_speech", payload: { ok: true } });
 	}
 }
 
@@ -654,28 +642,13 @@ function setPhase(nextPhase: ConversationPhase): void {
 	renderRobotFace();
 }
 
-function setSttSpeechActive(active: boolean, index?: number): void {
-	sttSpeechActive = active;
-	if (index !== undefined) currentSttIndex = index;
-	if (!active && (index === undefined || currentSttIndex === index)) currentSttIndex = undefined;
-	renderRobotFace();
-}
-
 function setTtsSpeaking(active: boolean): void {
 	ttsSpeaking = active;
-	if (active) ignoredSttIndex = undefined;
 	renderRobotFace();
 }
 
 function resetToListeningOrIdle(): void {
-	setPhase(recognitionWanted ? "listening" : "idle");
-}
-
-function assistantMessageHasToolCall(message: AgentMessageLike): boolean {
-	if (!Array.isArray(message.content)) return false;
-	return message.content.some(
-		(content) => typeof content === "object" && content !== null && "type" in content && content.type === "toolCall",
-	);
+	setPhase(recognitionWanted ? "listening" : "inactive");
 }
 
 function startFaceAmpLoop(analyser: AnalyserNode): () => void {
@@ -860,23 +833,9 @@ async function startRecognition(): Promise<void> {
 		log(`local STT started: phone PCM -> Parakeet/Silero server, browserRate=${micAudioContext.sampleRate}`, "stt");
 	} catch (error) {
 		recognitionWanted = false;
-		setPhase("idle");
+		setPhase("inactive");
 		log(`local STT start failed: ${error instanceof Error ? error.message : String(error)}`, "stt");
 	}
-}
-
-function stopRecognition(): void {
-	recognitionWanted = false;
-	micProcessor?.disconnect();
-	micProcessor = undefined;
-	micSource?.disconnect();
-	micSource = undefined;
-	for (const track of micStream?.getTracks() ?? []) track.stop();
-	micStream = undefined;
-	void micAudioContext?.close();
-	micAudioContext = undefined;
-	setPhase("idle");
-	log("local STT stopped", "stt");
 }
 
 function resetRecognitionAfterTts(): void {
@@ -890,16 +849,15 @@ function interruptTtsOnly(): void {
 	if ("speechSynthesis" in window) window.speechSynthesis.cancel();
 }
 
-function cancelSpeechFromServer(reason: string, sttIndex?: number): void {
+function cancelSpeech(reason: string): void {
 	const requestId = activeSpeakRequestId;
 	interruptTtsOnly();
 	setTtsSpeaking(false);
-	if (sttIndex !== undefined) ignoredSttIndex = sttIndex;
 	activeSpeakRequestId = undefined;
-	if (requestId) send({ type: "speak_cancelled", id: requestId });
+	if (requestId) send({ type: "robot_response", id: requestId, requestType: "speak", payload: { ok: true } });
 	ignoreMicUntil = Date.now() + 500;
 	resetToListeningOrIdle();
-	log(`TTS cancelled by server: ${reason}`, "stt");
+	log(`TTS cancelled: ${reason}`, "stt");
 }
 
 function stopLocalMotorsNow(): void {
@@ -916,7 +874,7 @@ function abortCurrentAgentTurn(): void {
 	interruptTtsOnly();
 	setTtsSpeaking(false);
 	stopLocalMotorsNow();
-	if (requestId) send({ type: "speak_cancelled", id: requestId });
+	if (requestId) send({ type: "robot_response", id: requestId, requestType: "speak", payload: { ok: true } });
 	activeSpeakRequestId = undefined;
 	ignoreMicUntil = Date.now() + 500;
 	showErrorFor(700);
@@ -936,7 +894,7 @@ function finishTts(message: string): void {
 	setTtsSpeaking(false);
 	const requestId = activeSpeakRequestId;
 	activeSpeakRequestId = undefined;
-	if (requestId) send({ type: "speak_done", id: requestId });
+	if (requestId) send({ type: "robot_response", id: requestId, requestType: "speak", payload: { ok: true } });
 	ignoreMicUntil = Date.now() + 500;
 	resetToListeningOrIdle();
 	resetRecognitionAfterTts();
@@ -951,7 +909,7 @@ function ttsProviderLabel(provider: "elevenlabs" | "pocket"): string {
 	return provider === "pocket" ? "Pocket TTS" : "ElevenLabs pibot";
 }
 
-function speakGerman(text: string, requestId?: string): void {
+function speakGerman(url: string, text: string, requestId: string): void {
 	const trimmed = text.trim();
 	if (!trimmed) {
 		finishTts("TTS skipped: empty text");
@@ -967,7 +925,7 @@ function speakGerman(text: string, requestId?: string): void {
 	setPhase("speaking");
 	ignoreMicUntil = 0;
 
-	const audio = new Audio(`/api/tts?provider=${encodeURIComponent(provider)}&text=${encodeURIComponent(trimmed)}`);
+	const audio = new Audio(`${url}&provider=${encodeURIComponent(provider)}`);
 	currentTtsAudio = audio;
 	createRobotVoiceEffect(audio);
 	audio.onplay = () => log(`${providerLabel} playing streamed response ${trimmed.length} chars`, "stt");
@@ -996,7 +954,7 @@ function robotModeActive(): boolean {
 
 function requestAutoReload(reason: string): void {
 	if (robotModeActive()) {
-		if (!autoReloadPending) log(`Auto-reload deferred while robot mode is active: ${reason}`, "agent");
+		if (!autoReloadPending) log(`Auto-reload deferred while robot mode is active: ${reason}`, "reload");
 		autoReloadPending = true;
 		return;
 	}
@@ -1019,7 +977,7 @@ async function pollReloadVersion(): Promise<void> {
 		}
 		if (data.version !== reloadVersion) requestAutoReload("server version changed");
 	} catch (error) {
-		sendClientLog("debug", `reload poll failed: ${error instanceof Error ? error.message : String(error)}`);
+		clientLogger.tag("debug").log(`reload poll failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 }
 
@@ -1039,95 +997,33 @@ connectReloadSocket();
 void pollReloadVersion();
 setInterval(() => void pollReloadVersion(), 2000);
 
-ws.onopen = () => log("ws connected");
-ws.onclose = (event) => log(`ws closed code=${event.code} reason=${event.reason || "none"}`);
-ws.onerror = () => log("ws error", "agent");
+ws.onopen = () => log("connected to robot server", "network");
+ws.onclose = (event) => {
+	if (event.code === 1008) {
+		showErrorFor(5000);
+		appendStructuredLogLine(
+			"client",
+			["error"],
+			`connection rejected: ${event.reason || "another client is already connected"}`,
+		);
+		return;
+	}
+	log(`disconnected from robot server code=${event.code} reason=${event.reason || "none"}`, "network");
+};
+ws.onerror = () => log("robot server connection error", "network");
 ws.onmessage = (event) => {
 	const message = JSON.parse(String(event.data)) as ServerMessage;
 
 	if (message.type === "robot_request") {
 		void handleRobotRequest(message);
 	}
-	if (message.type === "error") {
-		showErrorFor(1500);
-		resetToListeningOrIdle();
-		log(`ERROR ${message.message}`);
+	if (message.type === "hello" || message.type === "state") {
+		serverRobotState = message.state;
+		renderRobotFace();
 	}
-	if (message.type === "speak_request") {
-		if (ttsEnabled) speakGerman(message.text, message.id);
-		else send({ type: "speak_done", id: message.id });
+	if (message.type === "log") {
+		appendStructuredLogLine(message.entry.origin, message.entry.tags, message.entry.message);
 	}
-	if (message.type === "cancel_speech") {
-		cancelSpeechFromServer(message.reason, message.sttIndex);
-	}
-	if (message.type === "stt_event") {
-		const index = message.index;
-		const ignored = index !== undefined && index === ignoredSttIndex;
-		if (message.event === "loading") log("local STT loading Parakeet/Silero worker", "stt");
-		if (message.event === "ready") log("local STT worker ready", "stt");
-		if (message.event === "speech_start") {
-			setSttSpeechActive(!ignored, index);
-			log("STT speech started", "stt");
-		}
-		if (message.event === "speech_end") {
-			setSttSpeechActive(false, index);
-			log("STT speech ended, transcribing", "stt");
-		}
-		if (message.event === "speech_drop") {
-			setSttSpeechActive(false, index);
-			if (!ignored) resetToListeningOrIdle();
-		}
-		if (message.event === "error") {
-			showErrorFor(1500);
-			setPhase("idle");
-			log(`STT error ${message.message ?? "unknown"}`, "stt");
-		}
-	}
-	if (message.type === "session_reset") {
-		log("server confirmed session reset; context cleared", "agent");
-		resetToListeningOrIdle();
-		return;
-	}
-	if (message.type === "stt_interim") {
-		if (message.text.trim()) log(`STT interim: ${message.text}`, "stt");
-	}
-	if (message.type === "stt_final") {
-		log(
-			`STT final: ${message.text || "-"}${message.accepted ? "" : ` (ignored: ${message.ignoredReason ?? "unknown"})`}`,
-			"stt",
-		);
-		setSttSpeechActive(false, message.index);
-		if (message.index === ignoredSttIndex) ignoredSttIndex = undefined;
-		if (message.accepted) setPhase("thinking");
-		else resetToListeningOrIdle();
-	}
-	if (message.type === "agent_event") {
-		const agentEvent = message.event;
-		if (agentEvent.type === "message_start" && agentEvent.message.role === "assistant") {
-			setPhase("thinking");
-			assistantSpeechBuffer = "";
-		}
-		if (agentEvent.type === "message_update" && agentEvent.assistantMessageEvent?.type === "text_delta") {
-			const delta = agentEvent.assistantMessageEvent.delta ?? "";
-			assistantSpeechBuffer += delta;
-		}
-		if (agentEvent.type === "message_end" && agentEvent.message.role === "assistant") {
-			log(`LLM: ${assistantSpeechBuffer.trim()}`, "agent");
-			if (assistantMessageHasToolCall(agentEvent.message)) log("LLM message contains tool call", "agent");
-			if (!ttsEnabled) setPhase(recognitionWanted ? "listening" : "idle");
-		}
-		if (agentEvent.type === "tool_execution_start") {
-			showToolFor(1500);
-			log(`tool ${agentEvent.toolName} ${JSON.stringify(agentEvent.args)}`, "agent");
-		}
-	}
-};
-
-sendButton.onclick = () => {
-	const text = promptInput.value;
-	setPhase("thinking");
-	send({ type: "prompt", text });
-	log(`typed: ${text}`);
 };
 
 async function enterRobotMode(): Promise<void> {
@@ -1140,33 +1036,37 @@ async function enterRobotMode(): Promise<void> {
 	}
 }
 
-robotModeButton.onclick = () => {
-	void enterRobotMode();
-};
-
 startAllButton.onclick = async () => {
+	if (robotStarted) {
+		void enterRobotMode();
+		return;
+	}
 	startAllButton.disabled = true;
-	const previousLabel = startAllButton.textContent;
 	startAllButton.textContent = "Starting...";
 	try {
 		enableTts();
 		log(`TTS enabled: ${ttsProviderLabel(selectedTtsProvider())}`, "stt");
 		const usbOk = await connectFt232h(true);
-		if (!usbOk) log("FT232H not connected; motor tools will report errors", "agent");
+		if (!usbOk) log("FT232H not connected; motor tools will report errors", "hardware");
 		await startOrientationTracking().catch((error) =>
-			log(`Orientation tracking failed: ${error instanceof Error ? error.message : String(error)}`, "agent"),
+			log(`Orientation tracking failed: ${error instanceof Error ? error.message : String(error)}`, "orientation"),
 		);
 		try {
 			await ensureCameraStream();
-			log("Camera enabled", "agent");
+			log("Camera enabled", "camera");
 		} catch (error) {
-			log(`Camera enable failed: ${error instanceof Error ? error.message : String(error)}`, "agent");
+			log(`Camera enable failed: ${error instanceof Error ? error.message : String(error)}`, "camera");
 		}
 		await startRecognition();
-		await enterRobotMode();
-	} finally {
-		startAllButton.textContent = previousLabel;
+		robotStarted = true;
+		startAllButton.textContent = "Show face";
 		startAllButton.disabled = false;
+		await enterRobotMode();
+	} catch (error) {
+		robotStarted = false;
+		startAllButton.textContent = "Start robot";
+		startAllButton.disabled = false;
+		throw error;
 	}
 };
 
@@ -1197,26 +1097,10 @@ function handleRobotTouch(event: PointerEvent): void {
 
 robotSection.addEventListener("pointerdown", handleRobotTouch);
 
-micButton.onclick = () => {
-	log("STT start requested: local Parakeet/Silero", "stt");
-	void startRecognition();
-};
-
-stopMicButton.onclick = stopRecognition;
-
 resetSessionButton.onclick = () => {
 	if (!confirm("Reset session? All context messages will be lost.")) return;
 	send({ type: "reset_session" });
-	log("session reset requested", "agent");
-};
-
-enableCameraButton.onclick = async () => {
-	try {
-		await ensureCameraStream();
-		log("Camera enabled", "agent");
-	} catch (error) {
-		log(`Camera enable failed: ${error instanceof Error ? error.message : String(error)}`, "agent");
-	}
+	log("session reset requested", "ui");
 };
 
 if (cameraEnabled) void ensureCameraStream().catch(() => undefined);
@@ -1225,13 +1109,3 @@ ttsProviderControl.onchange = () => {
 	localStorage.setItem(ttsProviderKey, selectedTtsProvider());
 	log(`TTS provider selected: ${ttsProviderLabel(selectedTtsProvider())}`, "stt");
 };
-
-testTtsButton.onclick = () => {
-	enableTts();
-	speakGerman("Hallo, ich bin dein kleiner Roboter. Die Sprachausgabe ist bereit.");
-	log(`TTS enabled: ${ttsProviderLabel(selectedTtsProvider())}`, "stt");
-};
-
-log(
-	"STT uses local Parakeet batch transcription with Silero VAD endpointing. TTS is switchable: ElevenLabs pibot or Kyutai Pocket.",
-);

@@ -5,36 +5,31 @@
 		<meta name="viewport" content="width=device-width,initial-scale=1" />
 		<meta http-equiv="Cache-Control" content="no-store" />
 		<meta http-equiv="Pragma" content="no-cache" />
-		<title>Robot Agent Demo</title>
+		<title>Pipi</title>
 		<link rel="stylesheet" href="style.css?v=dev" />
 	</head>
 	<body>
 		<section id="setup">
-			<h1>Robot Agent Demo</h1>
-			<p>Continuous STT proof-of-concept + simulated motor tools.</p>
-			<button id="startAll" class="primary">Start robot</button>
-			<button id="resetSession">Reset session</button>
-			<details>
-				<summary>Debug controls</summary>
-				<button id="mic">Start continuous STT</button>
-				<button id="stopMic">Stop STT</button>
-				<label>
-					TTS
-					<select id="ttsProvider">
-						<option value="elevenlabs">ElevenLabs pibot</option>
-						<option value="pocket">Kyutai Pocket</option>
-					</select>
-				</label>
-				<button id="testTts">Test TTS</button>
-				<button id="enableCamera">Enable camera</button>
-				<button id="robotMode">Robot mode</button>
-			</details>
-			<div><input id="prompt" placeholder="type a command" /><button id="send">Send</button></div>
+			<h1>Pipi</h1>
+			<p>Phone-powered robot face and control.</p>
+			<div class="panel">
+				<button id="startAll" class="primary">Start robot</button>
+				<div class="controls">
+					<label>
+						Voice
+						<select id="ttsProvider">
+							<option value="elevenlabs">ElevenLabs pibot</option>
+							<option value="pocket">Kyutai Pocket</option>
+						</select>
+					</label>
+					<button id="resetSession">Reset session</button>
+				</div>
+			</div>
 			<div id="gyroStatus" class="status">Gyro: not active</div>
 			<pre id="log"></pre>
 		</section>
 		<section id="robot" hidden>
-			<div id="face" class="face idle">
+			<div id="face" class="face inactive">
 				<div class="brow left"></div>
 				<div class="brow right"></div>
 				<div class="eye left"></div>

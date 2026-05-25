@@ -1,12 +1,6 @@
-export type LogSink = (entry: LogEntry) => void | Promise<void>;
+import type { LogEntry, LogOrigin } from "../types.js";
 
-export interface LogEntry {
-	sequence: number;
-	time: number;
-	tags: string[];
-	message: string;
-	formatted: string;
-}
+export type LogSink = (entry: LogEntry) => void | Promise<void>;
 
 interface LoggerState {
 	sink: LogSink;
@@ -23,22 +17,19 @@ function tagColor(tag: string): string {
 	return colors[Math.abs(hash) % colors.length]!;
 }
 
-function formatTags(tags: string[], color: boolean): string {
-	return tags.map((tag) => (color ? `${tagColor(tag)}[${tag}]${reset}` : `[${tag}]`)).join("");
-}
-
-function defaultSink(entry: LogEntry): void {
-	console.log(formatEntry(entry, true));
-}
-
 export function formatEntry(entry: LogEntry, color = false): string {
-	const prefix = formatTags(entry.tags, color);
-	return prefix ? `${prefix} ${entry.message}` : entry.message;
+	const tags = [entry.origin, ...entry.tags.filter((tag, index) => index !== 0 || tag !== entry.origin)];
+	const prefix = tags.map((tag) => (color ? `${tagColor(tag)}[${tag}]${reset}` : `[${tag}]`)).join("");
+	return `${prefix} ${entry.message}`;
 }
 
 export class Logger {
 	constructor(
-		private readonly state: LoggerState = { sink: defaultSink, sequence: 0, queue: Promise.resolve() },
+		private readonly state: LoggerState = {
+			sink: (entry) => console.log(formatEntry(entry, true)),
+			sequence: 0,
+			queue: Promise.resolve(),
+		},
 		private readonly tags: string[] = [],
 	) {}
 
@@ -47,7 +38,19 @@ export class Logger {
 	}
 
 	log(message: string): void {
-		const entry = this.createEntry(message);
+		this.write("server", this.tags, message, Date.now());
+	}
+
+	logRaw(origin: LogOrigin, tags: string[], message: string, time = Date.now()): void {
+		this.write(origin, tags, message, time);
+	}
+
+	async flush(): Promise<void> {
+		await this.state.queue;
+	}
+
+	private write(origin: LogOrigin, tags: string[], message: string, time: number): void {
+		const entry = this.createEntry(origin, tags, message, time);
 		this.state.queue = this.state.queue
 			.catch(() => undefined)
 			.then(() => this.state.sink(entry))
@@ -56,17 +59,14 @@ export class Logger {
 			);
 	}
 
-	async flush(): Promise<void> {
-		await this.state.queue;
-	}
-
-	private createEntry(message: string): LogEntry {
+	private createEntry(origin: LogOrigin, tags: string[], message: string, time: number): LogEntry {
 		return {
+			origin,
 			sequence: ++this.state.sequence,
-			time: Date.now(),
-			tags: this.tags,
+			time,
+			tags,
 			message,
-			formatted: formatEntry({ sequence: 0, time: 0, tags: this.tags, message, formatted: "" }),
+			formatted: formatEntry({ origin, sequence: 0, time: 0, tags, message, formatted: "" }),
 		};
 	}
 }

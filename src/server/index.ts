@@ -1,320 +1,227 @@
-import { readFile } from "node:fs/promises";
-import { createServer, type IncomingMessage } from "node:http";
-import { extname, join, resolve } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
-import { AgentHarness, InMemorySessionRepo } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
-import {
-	type Api,
-	type AssistantMessage,
-	getModel,
-	getModels,
-	getProviders,
-	type KnownProvider,
-	type Model,
-	type TextContent,
-} from "@earendil-works/pi-ai";
-import { WebSocket, WebSocketServer } from "ws";
-import type { ClientLogMsg, ClientMessage } from "../types.js";
-import { createLogger } from "./logger.js";
-import { createEnvMemoryStore } from "./memory-store.js";
+import type { RobotState, ServerMessage } from "../types.js";
+import { serverConfig } from "./config.js";
+import { createRobotHarness, type RobotHarnessEvent } from "./harness.js";
+import { createHttpServer } from "./http-server.js";
+import { createLogger, formatEntry } from "./logger.js";
+import { createFileMemoryStore } from "./memory-store.js";
 import { RobotClient } from "./robot-client.js";
-import { createSttService } from "./stt.js";
-import { createRobotTools, pruneImagesForContext, stopMotorFireAndForget } from "./tools/index.js";
-import { createTtsService } from "./tts.js";
+import { onShutdown } from "./shutdown.js";
+import { createSttService, type SttEvent } from "./stt.js";
+import { stopMotorFireAndForget } from "./tools/index.js";
+import { createTtsService, type TtsEvent } from "./tts.js";
+import { attachWebSockets as createWebSocketServer, type WebsocketEvent } from "./websocket-server.js";
 
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const publicDir = resolve(__dirname, "../../public");
-const port = Number(process.env.PORT ?? 8010);
-const parakeetSttWorkerPath = resolve(__dirname, "../../scripts/parakeet-stt-worker.py");
-const serverVersion = String(Date.now());
-const maxContextImages = Number(process.env.MAX_CONTEXT_IMAGES ?? 4);
+let broadcast: (message: ServerMessage) => void = () => undefined;
+let robotState: RobotState = { phase: "inactive" };
+let speechActive = false;
+let lastSpeechEndedAt = 0;
 
-const logger = createLogger();
-const serverLogger = logger.tag("server");
-const clientLogger = logger.tag("client");
-const agentLogger = logger.tag("agent");
-const contextLogger = logger.tag("context");
-const clients = new Set<WebSocket>();
-const robot = new RobotClient(logger);
-const executionEnv = new NodeExecutionEnv({ cwd: process.cwd() });
-const memoryStore = createEnvMemoryStore(executionEnv, { path: process.env.MEMORY_FILE ?? "data/memories.json" });
-let sttPromptQueue: Promise<void> = Promise.resolve();
-let harness: AgentHarness;
-
-async function readRequestJson<T>(req: AsyncIterable<Uint8Array>): Promise<T> {
-	const chunks: Uint8Array[] = [];
-	for await (const chunk of req) chunks.push(chunk);
-	return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
-}
-
-function logClientMessage(msg: ClientLogMsg): void {
-	clientLogger.tag(msg.level).log(msg.message);
-}
-
-function broadcast(data: object): void {
-	const msg = JSON.stringify(data);
-	for (const client of clients) {
-		if (client.readyState === WebSocket.OPEN) client.send(msg);
-	}
-}
-
-function extractAssistantText(message: AssistantMessage): string {
-	return message.content
-		.filter((entry): entry is TextContent => entry.type === "text")
-		.map((entry) => entry.text)
-		.join("")
-		.trim();
-}
-
-function formatMemoriesForSystemPrompt(memories: string[]): string {
-	if (memories.length === 0) return "No stored memories yet.";
-	return memories.map((memory, index) => `${index}: ${memory}`).join("\n");
-}
-
-function selectModel(): Model<Api> {
-	const provider = process.env.PI_PROVIDER ?? "anthropic";
-	const modelId = process.env.PI_MODEL ?? "claude-haiku-4-5";
-	if (!getProviders().includes(provider as KnownProvider)) {
-		throw new Error(`Unknown PI_PROVIDER: ${provider}`);
-	}
-	const models = getModels(provider as KnownProvider);
-	if (!models.some((model) => model.id === modelId)) {
-		throw new Error(`Unknown PI_MODEL for ${provider}: ${modelId}`);
-	}
-	return getModel(provider as KnownProvider, modelId as never) as Model<Api>;
-}
-
-const ttsService = createTtsService({
-	logger,
-	getRobotClient: () => robot.currentClient(),
+const logger = createLogger((entry) => {
+	console.log(formatEntry(entry, true));
+	broadcast({ type: "log", entry });
 });
+const serverLogger = logger.tag("server");
+const agentLogger = logger.tag("agent");
+const sttLogger = logger.tag("stt");
+const ttsLogger = logger.tag("tts");
+const contextLogger = logger.tag("context");
+const executionEnv = new NodeExecutionEnv({ cwd: process.cwd() });
+const memoryStore = createFileMemoryStore(executionEnv, { path: serverConfig.memoryFile });
+const robot = new RobotClient();
+const tts = createTtsService({ onEvent: handleTtsEvent });
+const stt = createSttService({ workerPath: serverConfig.parakeetSttWorkerPath, onEvent: handleSttEvent });
+const harness = await createRobotHarness({
+	env: executionEnv,
+	memoryStore,
+	maxContextImages: serverConfig.maxContextImages,
+	robot,
+	onEvent: handleHarnessEvent,
+});
+const http = createHttpServer({
+	publicDir: serverConfig.publicDir,
+	version: serverConfig.version,
+	fetchTtsAudio: tts.fetchTtsAudio,
+});
+const websockets = createWebSocketServer({
+	server: http.server,
+	onEvent: handleWebsocketEvent,
+});
+broadcast = websockets.broadcast;
 
-async function performHarnessAbort(reason: string, sttIndex?: number): Promise<void> {
+function setRobotState(state: RobotState): void {
+	robotState = state;
+	broadcast({ type: "state", state });
+}
+
+function assistantText(): string {
+	return "assistantText" in robotState ? robotState.assistantText : "";
+}
+
+function submitPrompt(text: string): void {
+	setRobotState({ phase: "thinking", heardText: text, assistantText: "" });
+	void harness
+		.current()
+		.prompt(text)
+		.catch((error) => {
+			const message = error instanceof Error ? error.message : String(error);
+			if (message.includes("busy")) {
+				sttLogger.log(`ignored final while agent busy: ${JSON.stringify(text)}`);
+				setRobotState({ phase: "listening" });
+				return;
+			}
+			sttLogger.log(`prompt failed: ${message}`);
+			setRobotState({ phase: "error", message });
+		});
+}
+
+function handleSttEvent(event: SttEvent): void {
+	if (event.type === "loading") sttLogger.log("loading Parakeet/Silero worker");
+	if (event.type === "ready") {
+		sttLogger.log(
+			`Parakeet ready sampleRate=${event.sampleRate} vadChunkMs=${event.vadChunkMs} threshold=${event.vadThreshold} minSilenceMs=${event.minSilenceMs} prerollMs=${event.prerollMs} interimIntervalMs=${event.interimIntervalMs ?? "off"}`,
+		);
+		setRobotState({ phase: "listening" });
+	}
+	if (event.type === "worker_log") sttLogger.log(event.line);
+	if (event.type === "worker_exit") {
+		sttLogger.log(`Parakeet worker exited code=${event.code ?? "none"} signal=${event.signal ?? "none"}`);
+	}
+	if (event.type === "parse_error") sttLogger.log(`failed to parse worker line: ${event.line}; ${event.message}`);
+	if (event.type === "speech_start") {
+		sttLogger.log(`speech_start #${event.index}`);
+		setRobotState({ phase: "hearing" });
+	}
+	if (event.type === "speech_end") {
+		sttLogger.log(`speech_end #${event.index} duration=${event.duration.toFixed(2)}s`);
+	}
+	if (event.type === "speech_drop") {
+		sttLogger.log(`speech_drop #${event.index} reason=${event.reason} duration=${event.duration.toFixed(2)}s`);
+		setRobotState({ phase: "listening" });
+	}
+	if (event.type === "interim") {
+		sttLogger.log(
+			`interim #${event.index} audioMs=${event.audioMs} decodeMs=${event.decodeMs} text=${JSON.stringify(event.text)}`,
+		);
+	}
+	if (event.type === "error") setRobotState({ phase: "error", message: event.message });
+	if (event.type === "stop_detected") {
+		sttLogger.log(`stop-word detected in ${event.source}`);
+		void abortRobotTurn(`${event.source} stop word: ${event.text}`);
+	}
+	if (event.type === "final") {
+		sttLogger.log(`final #${event.index} decodeMs=${event.decodeMs} text=${JSON.stringify(event.text)}`);
+		if (!event.text || speechActive || Date.now() - lastSpeechEndedAt < 1500) {
+			setRobotState({ phase: "listening" });
+			return;
+		}
+		submitPrompt(event.text);
+	}
+}
+
+function handleTtsEvent(event: TtsEvent): void {
+	if (event.type === "speech_registered") {
+		speechActive = true;
+		ttsLogger.log(`registered speech id=${event.id} chars=${event.chars}`);
+	}
+	if (event.type === "speech_resolved") {
+		speechActive = false;
+		lastSpeechEndedAt = Date.now();
+		ttsLogger.log(`speech resolved id=${event.id}`);
+	}
+	if (event.type === "pocket_starting") ttsLogger.log(`starting Pocket TTS: ${event.command}`);
+	if (event.type === "pocket_ready") ttsLogger.log(`Pocket TTS ready at ${event.url}`);
+	if (event.type === "pocket_log") ttsLogger.tag("pocket").log(event.line);
+	if (event.type === "pocket_error") ttsLogger.log(`Pocket TTS failed to start: ${event.message}`);
+	if (event.type === "pocket_exit") {
+		ttsLogger.log(`Pocket TTS exited code=${event.code ?? "none"} signal=${event.signal ?? "none"}`);
+	}
+	if (event.type === "elevenlabs_voice_lookup_failed")
+		ttsLogger.log(`ElevenLabs voice lookup failed: ${event.message}`);
+}
+
+async function speakAssistantText(text: string): Promise<void> {
+	setRobotState(text ? { phase: "speaking", assistantText: text } : { phase: "listening" });
+	const speech = tts.registerSpeech(text);
+	if (!speech) return;
+	try {
+		await robot.execute({ type: "speak", payload: { url: speech.url, text }, timeoutMs: null });
+	} finally {
+		tts.resolveSpeech(speech.id);
+		setRobotState({ phase: "listening" });
+	}
+}
+
+async function handleHarnessEvent(event: RobotHarnessEvent): Promise<void> {
+	if (event.type === "assistant_start") setRobotState({ phase: "thinking", assistantText: "" });
+	if (event.type === "tool_start") {
+		setRobotState({ phase: "tool", name: event.name, args: event.args, assistantText: assistantText() });
+		agentLogger.log(`tool ${event.name} ${JSON.stringify(event.args)}`);
+	}
+	if (event.type === "assistant_end") {
+		if (event.text) agentLogger.log(`LLM: ${event.text}`);
+		await speakAssistantText(event.text);
+	}
+	if (event.type === "context_pruned") {
+		contextLogger.log(`removed ${event.removedImages} old image(s), kept ${event.keptImages}`);
+	}
+	if (event.type === "session_reset") {
+		setRobotState({ phase: "inactive" });
+		agentLogger.log("session reset; context cleared");
+	}
+}
+
+async function abortRobotTurn(reason: string): Promise<void> {
 	agentLogger.log(`abort: ${reason}`);
-	ttsService.cancelSpeechOnClients(reason, sttIndex);
-	ttsService.resolveAllSpeech();
+	void robot.execute({ type: "cancel_speech", payload: { reason }, timeoutMs: 1000 }).catch(() => undefined);
+	tts.resolveAllSpeech();
 	robot.rejectAll(reason);
 	stopMotorFireAndForget(robot);
 	try {
-		await harness.abort();
+		await harness.current().abort();
 	} catch (error) {
 		agentLogger.log(`harness abort error: ${error instanceof Error ? error.message : String(error)}`);
 	}
+	setRobotState({ phase: "listening" });
 }
 
-function enqueueSttPrompt(text: string): void {
-	sttPromptQueue = sttPromptQueue.then(async () => {
-		for (let attempt = 1; attempt <= 30; attempt++) {
-			try {
-				await harness.prompt(`${text}`);
-				return;
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				if (!message.includes("busy") || attempt === 30) {
-					logger.tag("stt").log(`prompt failed: ${message}`);
-					broadcast({ type: "stt_event", event: "error", message });
-					return;
-				}
-				logger.tag("stt").log(`harness busy; retrying prompt in 500ms attempt=${attempt}`);
-				await sleep(500);
-			}
-		}
-	});
-}
-
-const sttService = createSttService({
-	workerPath: parakeetSttWorkerPath,
-	logger,
-	broadcast,
-	enqueuePrompt: enqueueSttPrompt,
-	performAbort: performHarnessAbort,
-	shouldIgnoreNonStopFinal: ttsService.shouldIgnoreNonStopSttAsTtsBleed,
-});
-
-function stopChildProcesses(): void {
-	ttsService.stopChildProcess();
-	sttService.stopChildProcess();
-	robot.stop();
-}
-
-process.once("exit", stopChildProcesses);
-process.once("SIGINT", async () => {
-	stopChildProcesses();
-	await logger.flush();
-	process.exit(130);
-});
-process.once("SIGTERM", async () => {
-	stopChildProcesses();
-	await logger.flush();
-	process.exit(143);
-});
-
-const tools = createRobotTools(robot, memoryStore);
-const sessionRepo = new InMemorySessionRepo();
-
-async function buildHarness(): Promise<AgentHarness> {
-	const session = await sessionRepo.create({ id: `robot-demo-${Date.now()}` });
-	const newHarness = new AgentHarness({
-		env: executionEnv,
-		session,
-		model: selectModel(),
-		getApiKeyAndHeaders: async (model) => {
-			const envName = `${model.provider.toUpperCase()}_API_KEY`.replaceAll("-", "_");
-			const apiKey = process.env[envName] ?? process.env.OPENAI_API_KEY ?? process.env.ANTHROPIC_API_KEY;
-			return apiKey ? { apiKey } : undefined;
-		},
-		tools,
-		systemPrompt:
-			async () => `Du bist das Gehirn eines kleinen Roboters mit Smartphone. Antworte immer auf Deutsch. Sei verspielt, freundlich und sicher. Verwende keine Emojis. Nutze Bewegungswerkzeuge nur für kurze Dauer. Die Bewegungswerkzeuge stoppen automatisch nach ihrer Dauer. Die Hardware kann nur vorwärts fahren und sich gegen den Uhrzeigersinn drehen; rückwärts und rechts gibt es nicht. Für ungefähre Drehwinkel nutze turn_left_degrees. Wenn du aktuelle Fakten oder Internet-Informationen brauchst, nutze web_search. Wenn du Details aus einem gefundenen Treffer brauchst, nutze fetch_page_content mit der URL.
-
-Persistente Erinnerungen:
-${formatMemoriesForSystemPrompt(await memoryStore.list())}
-
-Memory-Tool-Aufrufschema:
-- Alle Erinnerungen lesen: memory({"action":"read"})
-- Neue Erinnerung speichern: memory({"action":"append","text":"Pipi ist der Name des Roboters"})
-- Erinnerung löschen: memory({"action":"remove","index":0})`,
-	});
-	newHarness.on("context", (event) => ({
-		messages: pruneImagesForContext(event.messages, maxContextImages, contextLogger),
-	}));
-	newHarness.subscribe(async (event) => {
-		broadcast({ type: "agent_event", event });
-		if (event.type === "message_end" && event.message.role === "assistant") {
-			await ttsService.speakOnClient(extractAssistantText(event.message));
-		}
-	});
-	return newHarness;
-}
-
-harness = await buildHarness();
-
-async function resetHarnessSession(reason: string): Promise<void> {
-	serverLogger.log(`session reset: ${reason}`);
-	await performHarnessAbort(`reset: ${reason}`);
-	harness = await buildHarness();
-	broadcast({ type: "session_reset" });
-}
-
-async function handleClientMessage(msg: ClientMessage): Promise<void> {
-	if (msg.type === "client_log") {
-		logClientMessage(msg);
-		return;
+async function handleWebsocketEvent(event: WebsocketEvent): Promise<void> {
+	if (event.type === "client_connected") {
+		serverLogger.log("browser client connected");
+		event.client.send(JSON.stringify({ type: "hello", state: robotState }));
+		robot.setWebSocket(event.client);
+		logger.tag("robot").log("active robot client connected");
 	}
-	if (msg.type === "speak_done" || msg.type === "speak_cancelled") {
-		ttsService.resolveSpeech(msg.id);
-		return;
+	if (event.type === "client_rejected") serverLogger.log("rejected extra ws client");
+	if (event.type === "client_disconnected") {
+		serverLogger.log("browser client disconnected");
+		tts.resolveAllSpeech();
 	}
-	if (robot.handleMessage(msg)) return;
-	if (msg.type === "prompt") await harness.prompt(msg.text);
-	if (msg.type === "abort") await performHarnessAbort("client abort");
-	if (msg.type === "reset_session") await resetHarnessSession("client request");
-}
-
-const server = createServer(async (req, res) => {
-	const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-	if (url.pathname === "/__version" && req.method === "GET") {
-		res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-		res.end(JSON.stringify({ version: serverVersion }));
-		return;
-	}
-	if (url.pathname === "/api/client-log" && req.method === "POST") {
-		try {
-			logClientMessage(await readRequestJson<ClientLogMsg>(req));
-			res.writeHead(204).end();
-		} catch (error) {
-			serverLogger.log(`client log parse failed: ${error instanceof Error ? error.message : String(error)}`);
-			res.writeHead(400).end();
-		}
-		return;
-	}
-	if (url.pathname === "/api/tts" && req.method === "GET") {
-		try {
-			await ttsService.handleTtsRequest(
-				url.searchParams.get("text") ?? "",
-				url.searchParams.get("provider") ?? undefined,
-				res,
-			);
-		} catch (error) {
-			res.writeHead(500, { "content-type": "application/json" });
-			res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
-		}
-		return;
-	}
-	const path = url.pathname === "/" ? "/index.html" : url.pathname;
-	const file = join(publicDir, path);
-	if (!file.startsWith(publicDir)) {
-		res.writeHead(403).end();
-		return;
-	}
-	try {
-		const data = await readFile(file);
-		const extension = extname(file);
-		const contentType =
-			extension === ".js"
-				? "text/javascript; charset=utf-8"
-				: extension === ".css"
-					? "text/css; charset=utf-8"
-					: "text/html; charset=utf-8";
-		res.writeHead(200, {
-			"content-type": contentType,
-			"cache-control": "no-store, no-cache, must-revalidate, proxy-revalidate",
-			pragma: "no-cache",
-			expires: "0",
-		});
-		if (extension === ".html") {
-			res.end(
-				data
-					.toString("utf8")
-					.replaceAll("style.css?v=dev", `style.css?v=${serverVersion}`)
-					.replaceAll("app.js?v=dev", `app.js?v=${serverVersion}`),
-			);
+	if (event.type === "client_message") {
+		const msg = event.message;
+		if (msg.type === "client_log") {
+			logger.logRaw("client", msg.tags, msg.message, msg.time);
 			return;
 		}
-		res.end(data);
-	} catch {
-		res.writeHead(404).end("not found");
-	}
-});
-
-const wss = new WebSocketServer({ noServer: true });
-const reloadWss = new WebSocketServer({ noServer: true });
-
-server.on("upgrade", (req, socket, head) => {
-	const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-	const target = url.pathname === "/__reload" ? reloadWss : wss;
-	target.handleUpgrade(req, socket, head, (ws) => target.emit("connection", ws, req));
-});
-
-wss.on("connection", (ws, _req: IncomingMessage) => {
-	clients.add(ws);
-	serverLogger.log("ws client connected");
-	robot.handleConnection(ws);
-	ws.send(JSON.stringify({ type: "hello" }));
-	ws.on("message", async (data, isBinary) => {
-		try {
-			if (isBinary) {
-				sttService.handleAudioFrame(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer));
-				return;
-			}
-			await handleClientMessage(JSON.parse(String(data)) as ClientMessage);
-		} catch (error) {
-			ws.send(JSON.stringify({ type: "error", message: error instanceof Error ? error.message : String(error) }));
+		if (robot.handleMessage(msg)) return;
+		if (msg.type === "abort") await abortRobotTurn("client abort");
+		if (msg.type === "reset_session") {
+			serverLogger.log("session reset: client request");
+			await abortRobotTurn("reset: client request");
+			await harness.reset("client request");
 		}
-	});
-	ws.on("close", () => {
-		serverLogger.log("ws client disconnected");
-		clients.delete(ws);
-		robot.handleDisconnect(ws);
-		robot.selectFallback(clients);
-		ttsService.resolveSpeechForClient(ws);
-	});
+	}
+	if (event.type === "audio_frame") stt.handleAudioFrame(event.data);
+	if (event.type === "message_error") logger.tag("server").tag("error").log(event.message);
+}
+
+onShutdown(async () => {
+	tts.stopChildProcess();
+	stt.stopChildProcess();
+	robot.stop();
+	await logger.flush();
 });
 
-reloadWss.on("connection", () => {
-	// The client reloads when this socket reconnects after the dev supervisor restarts the server.
-});
-
-server.listen(port, "0.0.0.0", () => serverLogger.log(`robot demo: http://localhost:${port}`));
+http.server.listen(serverConfig.port, serverConfig.host, () =>
+	serverLogger.log(`robot demo: http://${serverConfig.host}:${serverConfig.port}`),
+);

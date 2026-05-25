@@ -1,43 +1,36 @@
 import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import type { ClientMessage, RobotRpcMap, RobotRpcType, RobotWireResponse } from "../types.js";
-import type { Logger } from "./logger.js";
 
 type RobotRpcResponse = RobotRpcMap[RobotRpcType]["response"];
 
 interface PendingRobotRequest {
-	client: WebSocket;
 	requestType: RobotRpcType;
 	resolve: (value: RobotRpcResponse) => void;
 	reject: (error: Error) => void;
-	timeout: NodeJS.Timeout;
+	timeout: NodeJS.Timeout | undefined;
 }
 
 export class RobotClient {
 	private current: WebSocket | undefined;
 	private readonly pending = new Map<string, PendingRobotRequest>();
 	private readonly heartbeat: NodeJS.Timeout;
-	private readonly logger: Logger;
 
-	constructor(logger: Logger) {
-		this.logger = logger.tag("robot");
+	constructor() {
 		this.heartbeat = setInterval(() => this.checkConnection(), 5000);
 	}
 
-	currentClient(): WebSocket | undefined {
-		return this.current;
+	setWebSocket(client: WebSocket): void {
+		if (this.current?.readyState === WebSocket.OPEN) return;
+		this.current = client;
+		client.once("close", () => this.clearWebSocket(client));
+		client.once("error", () => this.clearWebSocket(client));
 	}
 
-	handleConnection(client: WebSocket): void {
-		if (!this.current || this.current.readyState !== WebSocket.OPEN) {
-			this.current = client;
-			this.logger.log("selected client");
-		}
-	}
-
-	handleDisconnect(client: WebSocket): void {
-		this.rejectPendingForClient(client, new Error("Robot client disconnected"));
-		if (this.current === client) this.current = undefined;
+	private clearWebSocket(client: WebSocket): void {
+		if (this.current !== client) return;
+		this.current = undefined;
+		this.rejectAll("Robot client disconnected");
 	}
 
 	handleMessage(msg: ClientMessage): boolean {
@@ -49,19 +42,20 @@ export class RobotClient {
 	async execute<const T extends RobotRpcType>(request: {
 		type: T;
 		payload: RobotRpcMap[T]["request"];
-		timeoutMs?: number;
+		timeoutMs: number | null;
 	}): Promise<RobotRpcMap[T]["response"]> {
 		const client = this.current;
 		if (!client || client.readyState !== WebSocket.OPEN) throw new Error("Robot client not connected");
 		const id = randomUUID();
-		const timeoutMs = request.timeoutMs ?? 15000;
 		client.send(JSON.stringify({ type: "robot_request", id, request }));
 		return await new Promise<RobotRpcMap[T]["response"]>((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				this.rejectPending(id, new Error(`Robot request timed out: ${request.type}`));
-			}, timeoutMs);
+			const timeout =
+				request.timeoutMs === null
+					? undefined
+					: setTimeout(() => {
+							this.rejectPending(id, new Error(`Robot request timed out: ${request.type}`));
+						}, request.timeoutMs);
 			this.pending.set(id, {
-				client,
 				requestType: request.type,
 				resolve: (value) => resolve(value as RobotRpcMap[T]["response"]),
 				reject,
@@ -79,11 +73,6 @@ export class RobotClient {
 		this.rejectAll("Robot client stopped");
 	}
 
-	selectFallback(candidates: Iterable<WebSocket>): void {
-		this.current = [...candidates][0];
-		if (this.current) this.logger.log("selected fallback client");
-	}
-
 	private resolveResponse(response: RobotWireResponse): void {
 		const pending = this.pending.get(response.id);
 		if (!pending) return;
@@ -94,7 +83,7 @@ export class RobotClient {
 			);
 			return;
 		}
-		clearTimeout(pending.timeout);
+		if (pending.timeout) clearTimeout(pending.timeout);
 		this.pending.delete(response.id);
 		if (response.error) {
 			pending.reject(new Error(response.error));
@@ -110,28 +99,22 @@ export class RobotClient {
 	private rejectPending(id: string, error: Error): void {
 		const pending = this.pending.get(id);
 		if (!pending) return;
-		clearTimeout(pending.timeout);
+		if (pending.timeout) clearTimeout(pending.timeout);
 		this.pending.delete(id);
 		pending.reject(error);
-	}
-
-	private rejectPendingForClient(client: WebSocket, error: Error): void {
-		for (const [id, pending] of this.pending) {
-			if (pending.client === client) this.rejectPending(id, error);
-		}
 	}
 
 	private checkConnection(): void {
 		const client = this.current;
 		if (!client) return;
 		if (client.readyState !== WebSocket.OPEN) {
-			this.handleDisconnect(client);
+			this.clearWebSocket(client);
 			return;
 		}
 		try {
 			client.ping();
 		} catch {
-			this.handleDisconnect(client);
+			this.clearWebSocket(client);
 		}
 	}
 }

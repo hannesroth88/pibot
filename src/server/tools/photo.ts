@@ -22,7 +22,7 @@ export function createPhotoTool(robot: RobotClient): AgentTool<typeof emptyParam
 		description: "Take a photo of your surroundings using the phone front-facing camera.",
 		parameters: emptyParameters,
 		execute: async () => {
-			const result = await robot.execute({ type: "take_photo_request", payload: {}, timeoutMs: 15000 });
+			const result = await robot.execute({ type: "take_photo", payload: {}, timeoutMs: 15000 });
 			const capture = parsePhotoDataUrl(result.dataUrl);
 			if (!capture) throw new Error("Invalid photo data URL");
 			return {

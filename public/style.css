@@ -1,79 +1,110 @@
 body {
-	font-family: system-ui, sans-serif;
+	font-family: Inter, ui-sans-serif, system-ui, sans-serif;
 	margin: 0;
-	background: #111;
-	color: #eee;
+	background:
+		radial-gradient(circle at 50% -10%, rgba(68, 224, 255, 0.18), transparent 34rem),
+		linear-gradient(180deg, #111827, #05070b 72%);
+	color: #eef7ff;
 }
 
 #setup {
-	max-width: 800px;
-	margin: 2rem auto;
+	width: min(920px, calc(100vw - 2rem));
+	margin: 0 auto;
+	padding: clamp(1.5rem, 5vw, 4rem) 0;
+}
+
+#setup h1 {
+	margin: 0;
+	font-size: clamp(3.5rem, 14vw, 8rem);
+	line-height: 0.9;
+	letter-spacing: -0.08em;
+}
+
+#setup p {
+	margin: 1rem 0 2rem;
+	color: #a9bfd4;
+	font-size: clamp(1rem, 2.5vw, 1.25rem);
+}
+
+.panel {
+	display: grid;
+	gap: 1rem;
 	padding: 1rem;
+	border: 1px solid rgba(130, 210, 255, 0.18);
+	border-radius: 24px;
+	background: rgba(8, 14, 24, 0.76);
+	box-shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
+	backdrop-filter: blur(14px);
+}
+
+.controls {
+	display: flex;
+	gap: 0.75rem;
+	align-items: center;
+	flex-wrap: wrap;
 }
 
 button,
-input,
 select {
-	font-size: 1.1rem;
-	padding: 0.7rem;
-	margin: 0.25rem;
+	font: inherit;
+	font-size: 1rem;
+	padding: 0.8rem 1rem;
+	border: 1px solid rgba(180, 220, 255, 0.2);
+	border-radius: 14px;
+	background: rgba(255, 255, 255, 0.06);
+	color: #eef7ff;
+}
+
+select {
+	color-scheme: dark;
 }
 
 label {
 	display: inline-flex;
 	align-items: center;
-	gap: 0.35rem;
+	gap: 0.6rem;
+	color: #b8c7d6;
+}
+
+button {
+	cursor: pointer;
 }
 
 button.primary {
-	font-size: 1.5rem;
-	padding: 1rem 1.6rem;
-	background: linear-gradient(180deg, #44e0ff, #1f7cff);
+	font-size: 1.35rem;
+	padding: 1.1rem 1.4rem;
+	background: linear-gradient(180deg, #5eeaff, #2f83ff);
 	color: #04101f;
 	border: 0;
-	border-radius: 12px;
-	font-weight: 700;
-	box-shadow: 0 0 32px rgba(64, 220, 255, 0.4);
-	cursor: pointer;
+	font-weight: 800;
+	box-shadow: 0 0 38px rgba(64, 220, 255, 0.34);
 }
 
-button.primary:hover {
-	filter: brightness(1.05);
+button:hover,
+select:hover {
+	filter: brightness(1.08);
 }
 
 button.primary:disabled {
-	opacity: 0.55;
-	cursor: progress;
-}
-
-details {
-	margin-top: 1.25rem;
-	padding: 0.5rem;
-	border: 1px solid #333;
-	border-radius: 8px;
-}
-
-details summary {
-	cursor: pointer;
-	padding: 0.25rem 0.5rem;
+	opacity: 0.65;
+	cursor: default;
 }
 
 .status {
-	margin: 0.75rem 0;
-	padding: 0.6rem 0.75rem;
-	border: 1px solid #2b5360;
-	border-radius: 8px;
+	margin: 1rem 0;
+	padding: 0.75rem 0.9rem;
+	border: 1px solid rgba(68, 224, 255, 0.18);
+	border-radius: 14px;
 	background: rgba(45, 180, 220, 0.08);
 	color: #bcefff;
 	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-input {
-	width: min(80vw, 420px);
-}
-
 pre {
-	background: #000;
+	margin: 0;
+	background: rgba(0, 0, 0, 0.58);
+	border: 1px solid rgba(255, 255, 255, 0.08);
+	border-radius: 18px;
 	padding: 1rem;
 	height: 45vh;
 	overflow: auto;
@@ -128,7 +159,7 @@ pre {
 		0 0 72px var(--eye-glow-soft),
 		inset 0 -14px 24px var(--eye-inset);
 	transform-origin: center;
-	animation: idle-blink 5.5s infinite;
+	animation: inactive-blink 5.5s infinite;
 	transition: box-shadow 220ms ease;
 }
 
@@ -161,7 +192,7 @@ pre {
 	transform: rotate(8deg);
 }
 
-.face.idle {
+.face.inactive {
 	--eye-mid: #58e8ff;
 	--eye-bot: #33a8ff;
 	--eye-glow: #66f4ff;
@@ -170,19 +201,19 @@ pre {
 	--face-glow-amp: rgba(64, 240, 255, 0.55);
 	--brow-mid: #9ff5ff;
 	--brow-glow: rgba(190, 250, 255, 0.55);
-	animation: idle-breathe 5.2s ease-in-out infinite;
+	animation: inactive-breathe 5.2s ease-in-out infinite;
 }
 
-.face.idle .eye {
-	animation: idle-blink 4.8s infinite, idle-look 13s infinite ease-in-out;
+.face.inactive .eye {
+	animation: inactive-blink 4.8s infinite, inactive-look 13s infinite ease-in-out;
 }
 
-.face.idle .brow.left {
-	animation: idle-brow-drift 8.5s ease-in-out infinite;
+.face.inactive .brow.left {
+	animation: inactive-brow-drift 8.5s ease-in-out infinite;
 }
 
-.face.idle .brow.right {
-	animation: idle-brow-drift 9.2s ease-in-out infinite -2.5s;
+.face.inactive .brow.right {
+	animation: inactive-brow-drift 9.2s ease-in-out infinite -2.5s;
 }
 
 .face.listening .eye {
@@ -330,7 +361,7 @@ pre {
 	color: #9cf;
 }
 
-@keyframes idle-blink {
+@keyframes inactive-blink {
 	0%,
 	46%,
 	52%,
@@ -344,7 +375,7 @@ pre {
 	}
 }
 
-@keyframes idle-breathe {
+@keyframes inactive-breathe {
 	0%,
 	100% {
 		transform: scale(1);
@@ -354,7 +385,7 @@ pre {
 	}
 }
 
-@keyframes idle-look {
+@keyframes inactive-look {
 	0%,
 	14% {
 		translate: 0 0;
@@ -385,7 +416,7 @@ pre {
 	}
 }
 
-@keyframes idle-brow-drift {
+@keyframes inactive-brow-drift {
 	0%,
 	100% {
 		top: 24%;

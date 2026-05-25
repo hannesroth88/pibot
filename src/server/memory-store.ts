@@ -10,7 +10,7 @@ function fileErrorMessage(error: unknown): string {
 	return JSON.stringify(error);
 }
 
-export function createEnvMemoryStore(env: ExecutionEnv, options: EnvMemoryStoreOptions): MemoryStore {
+export function createFileMemoryStore(env: ExecutionEnv, options: EnvMemoryStoreOptions): MemoryStore {
 	let memories: string[] | undefined;
 
 	async function load(): Promise<string[]> {

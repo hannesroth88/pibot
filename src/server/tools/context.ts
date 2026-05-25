@@ -1,7 +1,10 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Logger } from "../logger.js";
+export interface PrunedContext {
+	messages: AgentMessage[];
+	removedImages: number;
+}
 
-export function pruneImagesForContext(messages: AgentMessage[], maxImages: number, logger: Logger): AgentMessage[] {
+export function pruneImagesForContext(messages: AgentMessage[], maxImages: number): PrunedContext {
 	const prunedMessages = [...messages];
 	let imageCount = 0;
 	let removedImages = 0;
@@ -23,6 +26,5 @@ export function pruneImagesForContext(messages: AgentMessage[], maxImages: numbe
 		if (changed) prunedMessages[i] = { ...message, content };
 	}
 
-	if (removedImages > 0) logger.log(`removed ${removedImages} old image(s), kept ${maxImages}`);
-	return prunedMessages;
+	return { messages: prunedMessages, removedImages };
 }
