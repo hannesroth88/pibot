@@ -12,10 +12,17 @@ body {
 }
 
 button,
-input {
+input,
+select {
 	font-size: 1.1rem;
 	padding: 0.7rem;
 	margin: 0.25rem;
+}
+
+label {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.35rem;
 }
 
 input {

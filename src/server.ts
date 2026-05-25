@@ -1,7 +1,10 @@
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createConnection } from "node:net";
 import { extname, join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { AgentHarness, type AgentTool, InMemorySessionRepo } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
@@ -20,16 +23,24 @@ import { formatMemoriesForSystemPrompt, memoryTool } from "./memory.js";
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = resolve(__dirname, "../public");
 const port = Number(process.env.PORT ?? 8010);
+const pocketTtsPort = Number(process.env.POCKET_TTS_PORT ?? 8020);
+const pocketTtsBindHost = process.env.POCKET_TTS_BIND_HOST ?? "127.0.0.1";
+const pocketTtsLanguage = process.env.POCKET_TTS_LANGUAGE ?? "german";
+const pocketTtsVoice = process.env.POCKET_TTS_VOICE ?? "eve";
+const pocketTtsUrl = process.env.POCKET_TTS_URL ?? `http://127.0.0.1:${pocketTtsPort}/tts`;
 const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY;
-const fallbackElevenLabsVoiceId = process.env.ELEVENLABS_VOICE_ID ?? "r1pUec9VJPfpUaMUuRX2";
+const elevenLabsVoiceId = process.env.ELEVENLABS_VOICE_ID ?? "r1pUec9VJPfpUaMUuRX2";
 const elevenLabsVoiceName = process.env.ELEVENLABS_VOICE_NAME ?? "pibot";
 const elevenLabsModelId = process.env.ELEVENLABS_MODEL_ID ?? "eleven_v3";
+const defaultTtsProvider = process.env.TTS_PROVIDER ?? "elevenlabs";
+const parakeetSttWorkerPath = resolve(__dirname, "../scripts/parakeet-stt-worker.py");
 const serverVersion = String(Date.now());
 
 const motorParameters = Type.Object({
 	durationMs: Type.Optional(Type.Number({ description: "Duration in ms. Max 3000. Defaults to 500." })),
 });
 type ClientLogLevel = "log" | "info" | "warn" | "error" | "debug" | "app";
+type TtsProvider = "elevenlabs" | "pocket";
 
 interface ClientLogMsg {
 	type: "client_log";
@@ -42,7 +53,6 @@ interface ClientLogMsg {
 
 type ClientMsg =
 	| { type: "prompt"; text: string }
-	| { type: "stt"; text: string; final: boolean }
 	| { type: "photo_result"; id: string; dataUrl?: string; error?: string }
 	| { type: "sim_motor_result"; command: string; durationMs: number }
 	| { type: "speak_done"; id: string }
@@ -55,6 +65,22 @@ interface PhotoCapture {
 	mimeType: string;
 	base64: string;
 }
+
+type SttWorkerMsg =
+	| {
+			type: "ready";
+			sampleRate: number;
+			vadChunkMs: number;
+			vadThreshold: number;
+			minSilenceMs: number;
+			speechPadMs: number;
+			prerollMs: number;
+	  }
+	| { type: "speech_start"; index: number; time: number }
+	| { type: "speech_end"; index: number; duration: number }
+	| { type: "speech_drop"; index: number; duration: number; reason: string }
+	| { type: "final"; index: number; text: string; duration: number; decodeMs: number }
+	| { type: "error"; message: string };
 
 const clients = new Set<WebSocket>();
 const pendingSpeech = new Map<string, { client: WebSocket; resolve: () => void; timeout: NodeJS.Timeout }>();
@@ -69,8 +95,30 @@ const pendingPhotos = new Map<
 >();
 const clientUserAgents = new Map<WebSocket, string>();
 let robotClient: WebSocket | undefined;
-let elevenLabsVoiceIdPromise: Promise<string> | undefined;
+let pocketTtsProcess: ChildProcess | undefined;
+let pocketTtsStartPromise: Promise<void> | undefined;
+let pocketTtsLastError: Error | undefined;
+let parakeetSttProcess: ChildProcess | undefined;
+let parakeetSttReady = false;
+let parakeetSttLoadingAnnounced = false;
+let parakeetSttStdout = "";
+let sttPromptQueue: Promise<void> = Promise.resolve();
 const motorLog: Array<{ t: number; command: string; durationMs: number }> = [];
+
+function stopChildProcesses(): void {
+	pocketTtsProcess?.kill();
+	parakeetSttProcess?.kill();
+}
+
+process.once("exit", stopChildProcesses);
+process.once("SIGINT", () => {
+	stopChildProcesses();
+	process.exit(130);
+});
+process.once("SIGTERM", () => {
+	stopChildProcesses();
+	process.exit(143);
+});
 
 function readRecord(value: unknown): Record<string, unknown> {
 	return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
@@ -91,6 +139,116 @@ function broadcast(data: unknown): void {
 	const msg = JSON.stringify(data);
 	for (const client of clients) {
 		if (client.readyState === WebSocket.OPEN) client.send(msg);
+	}
+}
+
+function startParakeetSttWorker(): void {
+	if (parakeetSttProcess && !parakeetSttProcess.killed) return;
+	parakeetSttReady = false;
+	parakeetSttLoadingAnnounced = false;
+	parakeetSttStdout = "";
+	console.log("[stt] starting Parakeet STT worker via uvx");
+	const child = spawn("uvx", ["--with", "parakeet-mlx", "--with", "silero-vad", "python", parakeetSttWorkerPath], {
+		stdio: ["pipe", "pipe", "inherit"],
+	});
+	parakeetSttProcess = child;
+	child.stdout?.on("data", (data: Buffer) => handleParakeetSttStdout(data));
+	child.once("error", (error) => {
+		broadcast({ type: "stt_event", event: "error", message: error.message });
+		console.error(`[stt] Parakeet worker failed to start: ${error.message}`);
+	});
+	child.once("exit", (code, signal) => {
+		if (parakeetSttProcess === child) parakeetSttProcess = undefined;
+		parakeetSttReady = false;
+		console.warn(`[stt] Parakeet worker exited code=${code ?? "none"} signal=${signal ?? "none"}`);
+	});
+}
+
+function handleParakeetSttStdout(data: Buffer): void {
+	parakeetSttStdout += data.toString("utf8");
+	while (true) {
+		const newline = parakeetSttStdout.indexOf("\n");
+		if (newline < 0) return;
+		const line = parakeetSttStdout.slice(0, newline).trim();
+		parakeetSttStdout = parakeetSttStdout.slice(newline + 1);
+		if (!line) continue;
+		try {
+			handleParakeetSttMessage(JSON.parse(line) as SttWorkerMsg);
+		} catch (error) {
+			console.warn(
+				`[stt] failed to parse worker line: ${line}; ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+}
+
+function enqueueSttPrompt(text: string): void {
+	sttPromptQueue = sttPromptQueue.then(async () => {
+		for (let attempt = 1; attempt <= 30; attempt++) {
+			try {
+				await harness.prompt(`Vom Benutzer gehört: ${text}`);
+				return;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (!message.includes("busy") || attempt === 30) {
+					console.warn(`[stt] prompt failed: ${message}`);
+					broadcast({ type: "stt_event", event: "error", message });
+					return;
+				}
+				console.log(`[stt] harness busy; retrying prompt in 500ms attempt=${attempt}`);
+				await sleep(500);
+			}
+		}
+	});
+}
+
+function handleParakeetSttMessage(message: SttWorkerMsg): void {
+	if (message.type === "ready") {
+		parakeetSttReady = true;
+		console.log(
+			`[stt] Parakeet ready sampleRate=${message.sampleRate} vadChunkMs=${message.vadChunkMs} threshold=${message.vadThreshold} minSilenceMs=${message.minSilenceMs} prerollMs=${message.prerollMs}`,
+		);
+		broadcast({ type: "stt_event", event: "ready" });
+		return;
+	}
+	if (message.type === "speech_start") {
+		console.log(`[stt] speech_start #${message.index}`);
+		broadcast({ type: "stt_event", event: "speech_start" });
+		return;
+	}
+	if (message.type === "speech_end") {
+		console.log(`[stt] speech_end #${message.index} duration=${message.duration.toFixed(2)}s`);
+		broadcast({ type: "stt_event", event: "speech_end" });
+		return;
+	}
+	if (message.type === "speech_drop") {
+		console.log(
+			`[stt] speech_drop #${message.index} reason=${message.reason} duration=${message.duration.toFixed(2)}s`,
+		);
+		broadcast({ type: "stt_event", event: "speech_drop" });
+		return;
+	}
+	if (message.type === "final") {
+		const text = message.text.trim();
+		console.log(`[stt] final #${message.index} decodeMs=${message.decodeMs} text=${JSON.stringify(text)}`);
+		broadcast({ type: "stt_final", text });
+		if (text) enqueueSttPrompt(text);
+		return;
+	}
+	console.warn(`[stt] worker error: ${message.message}`);
+	broadcast({ type: "stt_event", event: "error", message: message.message });
+}
+
+function handleAudioFrame(data: Buffer): void {
+	startParakeetSttWorker();
+	if (!parakeetSttProcess?.stdin || parakeetSttProcess.stdin.destroyed) return;
+	const header = Buffer.allocUnsafe(4);
+	header.writeUInt32LE(data.byteLength, 0);
+	parakeetSttProcess.stdin.write(header);
+	parakeetSttProcess.stdin.write(data);
+	if (!parakeetSttReady && !parakeetSttLoadingAnnounced) {
+		parakeetSttLoadingAnnounced = true;
+		broadcast({ type: "stt_event", event: "loading" });
 	}
 }
 
@@ -293,41 +451,129 @@ harness.subscribe(async (event) => {
 	}
 });
 
-async function resolveElevenLabsVoiceId(): Promise<string> {
-	if (!elevenLabsApiKey || process.env.ELEVENLABS_VOICE_ID) return fallbackElevenLabsVoiceId;
-	elevenLabsVoiceIdPromise ??= (async () => {
-		const headers = { "xi-api-key": elevenLabsApiKey };
-		const voicesResponse = await fetch("https://api.elevenlabs.io/v1/voices", { headers });
-		if (voicesResponse.ok) {
-			const data = (await voicesResponse.json()) as { voices?: Array<{ name?: string; voice_id?: string }> };
-			const voice = data.voices?.find((entry) => entry.name === elevenLabsVoiceName);
-			if (voice?.voice_id) return voice.voice_id;
-		}
-		const sharedResponse = await fetch(
-			`https://api.elevenlabs.io/v1/shared-voices?search=${encodeURIComponent(elevenLabsVoiceName)}`,
-			{ headers },
-		);
-		if (sharedResponse.ok) {
-			const data = (await sharedResponse.json()) as { voices?: Array<{ name?: string; voice_id?: string }> };
-			const voice = data.voices?.find((entry) => entry.name === elevenLabsVoiceName);
-			if (voice?.voice_id) return voice.voice_id;
-		}
-		console.warn(`ElevenLabs voice not found by name: ${elevenLabsVoiceName}; using fallback voice id`);
-		return fallbackElevenLabsVoiceId;
-	})();
-	return elevenLabsVoiceIdPromise;
+function pocketTtsEndpoint(): { host: string; port: number } {
+	const url = new URL(pocketTtsUrl);
+	return { host: url.hostname, port: Number(url.port || (url.protocol === "https:" ? 443 : 80)) };
 }
 
-async function handleTtsRequest(text: string, res: ServerResponse): Promise<void> {
+async function canConnectToPocketTts(): Promise<boolean> {
+	const endpoint = pocketTtsEndpoint();
+	return await new Promise<boolean>((resolve) => {
+		const socket = createConnection({ host: endpoint.host, port: endpoint.port });
+		const done = (connected: boolean) => {
+			socket.removeAllListeners();
+			socket.destroy();
+			resolve(connected);
+		};
+		socket.setTimeout(500);
+		socket.once("connect", () => done(true));
+		socket.once("error", () => done(false));
+		socket.once("timeout", () => done(false));
+	});
+}
+
+function startPocketTtsProcess(): void {
+	if (pocketTtsProcess && !pocketTtsProcess.killed) return;
+	pocketTtsLastError = undefined;
+	console.log(
+		`[tts] starting Pocket TTS: uvx pocket-tts serve --language ${pocketTtsLanguage} --host ${pocketTtsBindHost} --port ${pocketTtsPort}`,
+	);
+	const child = spawn(
+		"uvx",
+		[
+			"pocket-tts",
+			"serve",
+			"--language",
+			pocketTtsLanguage,
+			"--host",
+			pocketTtsBindHost,
+			"--port",
+			String(pocketTtsPort),
+		],
+		{ stdio: ["ignore", "inherit", "inherit"] },
+	);
+	pocketTtsProcess = child;
+	child.once("error", (error) => {
+		pocketTtsLastError = error;
+		console.error(`[tts] Pocket TTS failed to start: ${error.message}`);
+	});
+	child.once("exit", (code, signal) => {
+		if (pocketTtsProcess === child) pocketTtsProcess = undefined;
+		if (code !== 0) console.warn(`[tts] Pocket TTS exited code=${code ?? "none"} signal=${signal ?? "none"}`);
+	});
+}
+
+async function ensurePocketTtsStarted(): Promise<void> {
+	if (await canConnectToPocketTts()) return;
+	pocketTtsStartPromise ??= (async () => {
+		if (!(await canConnectToPocketTts())) startPocketTtsProcess();
+		const deadline = Date.now() + 60000;
+		while (Date.now() < deadline) {
+			if (pocketTtsLastError) throw pocketTtsLastError;
+			if (await canConnectToPocketTts()) {
+				console.log(`[tts] Pocket TTS ready at ${pocketTtsUrl}`);
+				return;
+			}
+			await sleep(500);
+		}
+		throw new Error("Pocket TTS did not become ready within 60s. Install uv and ensure uvx pocket-tts works.");
+	})();
+	try {
+		await pocketTtsStartPromise;
+	} finally {
+		pocketTtsStartPromise = undefined;
+	}
+}
+
+function normalizeTtsProvider(value: string | undefined): TtsProvider {
+	if (value === "pocket" || value === "kyutai") return "pocket";
+	return "elevenlabs";
+}
+
+async function resolveElevenLabsVoiceId(): Promise<string> {
+	if (!elevenLabsApiKey || process.env.ELEVENLABS_VOICE_ID) return elevenLabsVoiceId;
+	try {
+		const response = await fetch("https://api.elevenlabs.io/v1/voices", {
+			headers: { "xi-api-key": elevenLabsApiKey },
+		});
+		if (!response.ok) return elevenLabsVoiceId;
+		const data = (await response.json()) as { voices?: Array<{ name?: string; voice_id?: string }> };
+		const voice = data.voices?.find((entry) => entry.name === elevenLabsVoiceName);
+		return voice?.voice_id ?? elevenLabsVoiceId;
+	} catch (error) {
+		console.warn(`[tts] ElevenLabs voice lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+		return elevenLabsVoiceId;
+	}
+}
+
+async function proxyAudioResponse(response: Response, res: ServerResponse, fallbackContentType: string): Promise<void> {
+	if (!response.ok || !response.body) {
+		res.writeHead(response.status || 502, { "content-type": "application/json" });
+		res.end(JSON.stringify({ error: await response.text() }));
+		return;
+	}
+	res.writeHead(200, {
+		"content-type": response.headers.get("content-type") ?? fallbackContentType,
+		"cache-control": "no-store",
+	});
+	for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
+		res.write(chunk);
+	}
+	res.end();
+}
+
+async function handlePocketTtsRequest(text: string, res: ServerResponse): Promise<void> {
+	await ensurePocketTtsStarted();
+	const form = new FormData();
+	form.set("text", text);
+	form.set("voice_url", pocketTtsVoice);
+	await proxyAudioResponse(await fetch(pocketTtsUrl, { method: "POST", body: form }), res, "audio/wav");
+}
+
+async function handleElevenLabsTtsRequest(text: string, res: ServerResponse): Promise<void> {
 	if (!elevenLabsApiKey) {
 		res.writeHead(503, { "content-type": "application/json" });
 		res.end(JSON.stringify({ error: "ELEVENLABS_API_KEY missing" }));
-		return;
-	}
-	const trimmed = text.trim();
-	if (!trimmed) {
-		res.writeHead(400, { "content-type": "application/json" });
-		res.end(JSON.stringify({ error: "text required" }));
 		return;
 	}
 	const voiceId = await resolveElevenLabsVoiceId();
@@ -340,22 +586,23 @@ async function handleTtsRequest(text: string, res: ServerResponse): Promise<void
 				"content-type": "application/json",
 				"xi-api-key": elevenLabsApiKey,
 			},
-			body: JSON.stringify({
-				text: trimmed,
-				model_id: elevenLabsModelId,
-			}),
+			body: JSON.stringify({ text, model_id: elevenLabsModelId }),
 		},
 	);
-	if (!response.ok || !response.body) {
-		res.writeHead(response.status || 502, { "content-type": "application/json" });
-		res.end(JSON.stringify({ error: await response.text() }));
+	await proxyAudioResponse(response, res, "audio/mpeg");
+}
+
+async function handleTtsRequest(text: string, providerValue: string | undefined, res: ServerResponse): Promise<void> {
+	const trimmed = text.trim();
+	if (!trimmed) {
+		res.writeHead(400, { "content-type": "application/json" });
+		res.end(JSON.stringify({ error: "text required" }));
 		return;
 	}
-	res.writeHead(200, { "content-type": "audio/mpeg", "cache-control": "no-store" });
-	for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
-		res.write(chunk);
-	}
-	res.end();
+	const provider = normalizeTtsProvider(providerValue ?? defaultTtsProvider);
+	res.setHeader("x-pibot-tts-provider", provider);
+	if (provider === "pocket") await handlePocketTtsRequest(trimmed, res);
+	else await handleElevenLabsTtsRequest(trimmed, res);
 }
 
 function parsePhotoDataUrl(dataUrl: string): { base64: string; mimeType: string } | undefined {
@@ -391,7 +638,6 @@ async function handleClientMessage(msg: ClientMsg): Promise<void> {
 		return;
 	}
 	if (msg.type === "prompt") await harness.prompt(msg.text);
-	if (msg.type === "stt" && msg.final && msg.text.trim()) await harness.prompt(`Vom Benutzer gehört: ${msg.text}`);
 	if (msg.type === "abort") {
 		resolveAllSpeech();
 		rejectAllPhotos("Aborted");
@@ -419,7 +665,7 @@ const server = createServer(async (req, res) => {
 	}
 	if (url.pathname === "/api/tts" && req.method === "GET") {
 		try {
-			await handleTtsRequest(url.searchParams.get("text") ?? "", res);
+			await handleTtsRequest(url.searchParams.get("text") ?? "", url.searchParams.get("provider") ?? undefined, res);
 		} catch (error) {
 			res.writeHead(500, { "content-type": "application/json" });
 			res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
@@ -472,8 +718,12 @@ wss.on("connection", (ws, req: IncomingMessage) => {
 	console.log(`[ws] client connected ua=${clientUserAgents.get(ws)}`);
 	selectRobotClient(ws);
 	ws.send(JSON.stringify({ type: "hello", motorLog }));
-	ws.on("message", async (data) => {
+	ws.on("message", async (data, isBinary) => {
 		try {
+			if (isBinary) {
+				handleAudioFrame(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer));
+				return;
+			}
 			await handleClientMessage(JSON.parse(String(data)) as ClientMsg);
 		} catch (error) {
 			ws.send(JSON.stringify({ type: "error", message: error instanceof Error ? error.message : String(error) }));

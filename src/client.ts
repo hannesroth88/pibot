@@ -4,6 +4,12 @@ type ServerMessage =
 	| { type: "take_photo_request"; id: string }
 	| { type: "error"; message: string }
 	| { type: "speak_request"; id: string; text: string }
+	| {
+			type: "stt_event";
+			event: "loading" | "ready" | "speech_start" | "speech_end" | "speech_drop" | "error";
+			message?: string;
+	  }
+	| { type: "stt_final"; text: string }
 	| { type: "agent_event"; event: AgentEvent };
 
 interface AgentMessageLike {
@@ -20,52 +26,6 @@ type AgentEvent =
 
 type ConversationPhase = "idle" | "listening" | "thinking" | "speaking";
 type RobotFaceState = "idle" | "listening" | "hearing" | "thinking" | "speaking" | "tool" | "error";
-type SpeechRecognitionConstructor = new () => SpeechRecognition;
-
-interface SpeechRecognitionAlternative {
-	transcript: string;
-}
-
-interface SpeechRecognitionResult {
-	readonly isFinal: boolean;
-	readonly length: number;
-	item(index: number): SpeechRecognitionAlternative;
-	[index: number]: SpeechRecognitionAlternative;
-}
-
-interface SpeechRecognitionResultList {
-	readonly length: number;
-	item(index: number): SpeechRecognitionResult;
-	[index: number]: SpeechRecognitionResult;
-}
-
-interface SpeechRecognitionEvent extends Event {
-	readonly resultIndex: number;
-	readonly results: SpeechRecognitionResultList;
-}
-
-interface SpeechRecognitionErrorEvent extends Event {
-	readonly error: string;
-}
-
-interface SpeechRecognition extends EventTarget {
-	continuous: boolean;
-	interimResults: boolean;
-	lang: string;
-	onstart: (() => void) | null;
-	onend: (() => void) | null;
-	onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
-	onresult: ((event: SpeechRecognitionEvent) => void) | null;
-	start(): void;
-	stop(): void;
-}
-
-declare global {
-	interface Window {
-		SpeechRecognition?: SpeechRecognitionConstructor;
-		webkitSpeechRecognition?: SpeechRecognitionConstructor;
-	}
-}
 
 const setup = document.querySelector<HTMLElement>("#setup");
 const robot = document.querySelector<HTMLElement>("#robot");
@@ -77,6 +37,7 @@ const robotModeButton = document.querySelector<HTMLButtonElement>("#robotMode");
 const backButton = document.querySelector<HTMLButtonElement>("#back");
 const micButton = document.querySelector<HTMLButtonElement>("#mic");
 const stopMicButton = document.querySelector<HTMLButtonElement>("#stopMic");
+const ttsProviderSelect = document.querySelector<HTMLSelectElement>("#ttsProvider");
 const testTtsButton = document.querySelector<HTMLButtonElement>("#testTts");
 const enableCameraButton = document.querySelector<HTMLButtonElement>("#enableCamera");
 
@@ -91,6 +52,7 @@ if (
 	!backButton ||
 	!micButton ||
 	!stopMicButton ||
+	!ttsProviderSelect ||
 	!testTtsButton ||
 	!enableCameraButton
 ) {
@@ -99,32 +61,32 @@ if (
 
 const logOutput = logEl;
 const robotFace = face;
+const ttsProviderControl = ttsProviderSelect;
 const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
 const ws = new WebSocket(`${wsProtocol}://${location.host}`);
 const ttsEnabledKey = "robot-tts-enabled";
-const isAndroid = /Android/i.test(navigator.userAgent);
-const recognitionRestartDelayMs = isAndroid ? 1800 : 300;
-const androidMaxFastRecognitionEnds = 2;
+const ttsProviderKey = "robot-tts-provider";
+const targetSttSampleRate = 16000;
 
-let recognition: SpeechRecognition | undefined;
 let recognitionWanted = false;
-let recognitionRestartTimer: ReturnType<typeof setTimeout> | undefined;
-let recognitionStartedAt = 0;
-let recognitionHadFinalResult = false;
-let androidFastRecognitionEnds = 0;
+let micStream: MediaStream | undefined;
+let micAudioContext: AudioContext | undefined;
+let micSource: MediaStreamAudioSourceNode | undefined;
+let micProcessor: ScriptProcessorNode | undefined;
 let assistantSpeechBuffer = "";
 let ttsEnabled = localStorage.getItem(ttsEnabledKey) === "true";
 let phase: ConversationPhase = "idle";
 let ignoreMicUntil = 0;
 let currentTtsAudio: HTMLAudioElement | undefined;
+let robotVoiceEffectCleanup: (() => void) | undefined;
 let audioContext: AudioContext | undefined;
-let activeRobotEffectNodes: AudioNode[] = [];
 let ttsGeneration = 0;
 let activeSpeakRequestId: string | undefined;
 let cameraStream: MediaStream | undefined;
 let cameraVideo: HTMLVideoElement | undefined;
 const cameraEnabledKey = "robot-camera-enabled";
 let cameraEnabled = localStorage.getItem(cameraEnabledKey) === "true";
+ttsProviderControl.value = localStorage.getItem(ttsProviderKey) ?? "elevenlabs";
 
 function stringifyLogValue(value: unknown): string {
 	if (value instanceof Error) return `${value.name}: ${value.message}\n${value.stack ?? ""}`.trim();
@@ -280,141 +242,94 @@ function assistantMessageHasToolCall(message: AgentMessageLike): boolean {
 	);
 }
 
-function normalizeCommandText(text: string): string {
-	return text
-		.toLowerCase()
-		.normalize("NFKD")
-		.replace(/[.,!?;:()[\]{}"'`´]/g, " ")
-		.replace(/\s+/g, " ")
-		.trim();
-}
-
-function containsStopCommand(text: string): boolean {
-	const normalized = normalizeCommandText(text);
-	if (!normalized) return false;
-	const stopPhrases = [
-		"stop",
-		"stopp",
-		"halt",
-		"anhalten",
-		"abbrechen",
-		"schluss",
-		"ruhe",
-		"sei still",
-		"hör auf",
-		"hoer auf",
-	];
-	return stopPhrases.some(
-		(phrase) =>
-			normalized === phrase ||
-			normalized.includes(` ${phrase} `) ||
-			normalized.startsWith(`${phrase} `) ||
-			normalized.endsWith(` ${phrase}`),
-	);
-}
-
 function clearCurrentTtsAudio(): void {
-	if (activeRobotEffectNodes.length > 0)
-		log(`Clearing ${activeRobotEffectNodes.length} robot voice effect nodes`, "stt");
+	robotVoiceEffectCleanup?.();
+	robotVoiceEffectCleanup = undefined;
 	if (!currentTtsAudio) return;
+	currentTtsAudio.onplay = null;
+	currentTtsAudio.onended = null;
+	currentTtsAudio.onerror = null;
 	currentTtsAudio.pause();
-	currentTtsAudio.src = "";
+	currentTtsAudio.removeAttribute("src");
+	currentTtsAudio.load();
 	currentTtsAudio = undefined;
-	activeRobotEffectNodes = [];
 }
 
-function createRobotEffect(audio: HTMLAudioElement): void {
+function createRobotVoiceEffect(audio: HTMLAudioElement): void {
 	try {
 		audioContext ??= new AudioContext();
 		void audioContext.resume();
 		const source = audioContext.createMediaElementSource(audio);
-
 		const highpass = audioContext.createBiquadFilter();
 		highpass.type = "highpass";
-		highpass.frequency.value = 130;
-
+		highpass.frequency.value = 150;
 		const lowpass = audioContext.createBiquadFilter();
 		lowpass.type = "lowpass";
-		lowpass.frequency.value = 6500;
-
+		lowpass.frequency.value = 7200;
 		const presence = audioContext.createBiquadFilter();
 		presence.type = "peaking";
-		presence.frequency.value = 2400;
-		presence.Q.value = 1;
-		presence.gain.value = 4;
-
-		const dryGain = audioContext.createGain();
-		dryGain.gain.value = 0.82;
-
-		const ringWetGain = audioContext.createGain();
-		ringWetGain.gain.value = 0.22;
+		presence.frequency.value = 2600;
+		presence.Q.value = 0.9;
+		presence.gain.value = 3.5;
+		const compressor = audioContext.createDynamicsCompressor();
+		compressor.threshold.value = -24;
+		compressor.knee.value = 18;
+		compressor.ratio.value = 3;
+		compressor.attack.value = 0.006;
+		compressor.release.value = 0.12;
+		const dry = audioContext.createGain();
+		dry.gain.value = 0.9;
 		const ringModulator = audioContext.createGain();
 		ringModulator.gain.value = 0;
+		const ringWet = audioContext.createGain();
+		ringWet.gain.value = 0.09;
 		const ringOsc = audioContext.createOscillator();
 		ringOsc.type = "sine";
-		ringOsc.frequency.value = 55;
+		ringOsc.frequency.value = 42;
 		ringOsc.connect(ringModulator.gain);
 		ringOsc.start();
-
-		const slap = audioContext.createDelay(0.3);
-		slap.delayTime.value = 0.085;
-		const slapFeedback = audioContext.createGain();
-		slapFeedback.gain.value = 0.18;
+		const slap = audioContext.createDelay(0.25);
+		slap.delayTime.value = 0.075;
 		const slapWet = audioContext.createGain();
-		slapWet.gain.value = 0.12;
-
-		const flutterLfo = audioContext.createOscillator();
-		flutterLfo.type = "sine";
-		flutterLfo.frequency.value = 6.5;
-		const flutterDepth = audioContext.createGain();
-		flutterDepth.gain.value = 0.04;
-		const flutter = audioContext.createGain();
-		flutter.gain.value = 0.96;
-		flutterLfo.connect(flutterDepth);
-		flutterDepth.connect(flutter.gain);
-		flutterLfo.start();
-
+		slapWet.gain.value = 0.045;
 		const output = audioContext.createGain();
-		output.gain.value = 0.95;
+		output.gain.value = 0.98;
 
 		source.connect(highpass);
 		highpass.connect(lowpass);
 		lowpass.connect(presence);
-
-		presence.connect(dryGain);
-		presence.connect(ringModulator);
-		ringModulator.connect(ringWetGain);
-
-		dryGain.connect(flutter);
-		ringWetGain.connect(flutter);
-
-		flutter.connect(output);
-		flutter.connect(slap);
-		slap.connect(slapFeedback);
-		slapFeedback.connect(slap);
+		presence.connect(compressor);
+		compressor.connect(dry);
+		compressor.connect(ringModulator);
+		ringModulator.connect(ringWet);
+		dry.connect(output);
+		ringWet.connect(output);
+		dry.connect(slap);
 		slap.connect(slapWet);
 		slapWet.connect(output);
 		output.connect(audioContext.destination);
-		activeRobotEffectNodes = [
-			source,
-			highpass,
-			lowpass,
-			presence,
-			dryGain,
-			ringModulator,
-			ringWetGain,
-			ringOsc,
-			flutter,
-			flutterLfo,
-			flutterDepth,
-			slap,
-			slapFeedback,
-			slapWet,
-			output,
-		];
-		log("Robot voice effect enabled (glados-ish)", "stt");
+		robotVoiceEffectCleanup = () => {
+			ringOsc.stop();
+			for (const node of [
+				source,
+				highpass,
+				lowpass,
+				presence,
+				compressor,
+				dry,
+				ringModulator,
+				ringWet,
+				ringOsc,
+				slap,
+				slapWet,
+				output,
+			]) {
+				node.disconnect();
+			}
+		};
+		log("Robot voice effect enabled", "stt");
 	} catch (error) {
-		activeRobotEffectNodes = [];
+		robotVoiceEffectCleanup = undefined;
 		log(`Robot voice effect unavailable: ${error instanceof Error ? error.message : String(error)}`, "stt");
 	}
 }
@@ -427,74 +342,74 @@ function micInputBlocked(): boolean {
 	return Date.now() < ignoreMicUntil || ttsOutputActive();
 }
 
-function scheduleRecognitionRestart(delayMs: number): void {
-	if (recognitionRestartTimer) clearTimeout(recognitionRestartTimer);
-	recognitionRestartTimer = setTimeout(() => {
-		recognitionRestartTimer = undefined;
-		if (recognitionWanted) startRecognition();
-	}, delayMs);
+function resampleToPcm16(input: Float32Array, inputSampleRate: number): Int16Array {
+	const ratio = inputSampleRate / targetSttSampleRate;
+	const outputLength = Math.max(1, Math.floor(input.length / ratio));
+	const output = new Int16Array(outputLength);
+	for (let i = 0; i < outputLength; i++) {
+		const start = Math.floor(i * ratio);
+		const end = Math.min(input.length, Math.floor((i + 1) * ratio));
+		let sum = 0;
+		for (let j = start; j < end; j++) sum += input[j] ?? 0;
+		const sample = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
+		output[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+	}
+	return output;
 }
 
-function startRecognition(): void {
-	if (recognition) return;
-	const SpeechRecognitionApi = window.SpeechRecognition ?? window.webkitSpeechRecognition;
-	if (!SpeechRecognitionApi) {
-		log("SpeechRecognition unavailable. Android Chrome usually has it; desktop support varies.");
-		return;
-	}
+function sendMicAudio(input: Float32Array, sampleRate: number): void {
+	if (!recognitionWanted || ws.readyState !== WebSocket.OPEN || micInputBlocked()) return;
+	const pcm = resampleToPcm16(input, sampleRate);
+	ws.send(pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + pcm.byteLength));
+}
 
-	recognitionStartedAt = Date.now();
-	recognitionHadFinalResult = false;
-	recognition = new SpeechRecognitionApi();
-	recognition.continuous = true;
-	recognition.interimResults = true;
-	recognition.lang = "de-DE";
-	recognition.onstart = () => {
-		if (phase === "idle") setPhase("listening");
-		log("continuous STT started: de-DE", "stt");
-	};
-	recognition.onerror = (event) => log(`stt error ${event.error}`, "stt");
-	recognition.onend = () => {
-		recognition = undefined;
-		const lifetimeMs = Date.now() - recognitionStartedAt;
-		log(`stt ended after ${lifetimeMs}ms`, "stt");
-		if (isAndroid && !recognitionHadFinalResult && lifetimeMs < 3000) {
-			androidFastRecognitionEnds++;
-			log(`Android STT fast-end ${androidFastRecognitionEnds}/${androidMaxFastRecognitionEnds}`, "stt");
-		} else {
-			androidFastRecognitionEnds = 0;
-		}
-		if (isAndroid && androidFastRecognitionEnds > androidMaxFastRecognitionEnds) {
-			recognitionWanted = false;
-			setPhase("idle");
-			log("Android Web Speech is ending immediately; stopped auto-restart to avoid mic chime loop.", "stt");
-			return;
-		}
-		if (recognitionWanted) scheduleRecognitionRestart(recognitionRestartDelayMs);
-	};
-	recognition.onresult = handleRecognitionResult;
-
+async function startRecognition(): Promise<void> {
+	if (micStream || micAudioContext) return;
+	recognitionWanted = true;
 	try {
-		recognition.start();
+		micStream = await navigator.mediaDevices.getUserMedia({
+			audio: {
+				echoCancellation: true,
+				noiseSuppression: true,
+				autoGainControl: true,
+			},
+			video: false,
+		});
+		micAudioContext = new AudioContext();
+		micSource = micAudioContext.createMediaStreamSource(micStream);
+		micProcessor = micAudioContext.createScriptProcessor(4096, 1, 1);
+		micProcessor.onaudioprocess = (event) => {
+			const input = event.inputBuffer.getChannelData(0);
+			sendMicAudio(input, event.inputBuffer.sampleRate);
+		};
+		micSource.connect(micProcessor);
+		micProcessor.connect(micAudioContext.destination);
+		setPhase("listening");
+		log(`local STT started: phone PCM -> Parakeet/Silero server, browserRate=${micAudioContext.sampleRate}`, "stt");
 	} catch (error) {
-		recognition = undefined;
-		log(`stt start failed: ${error instanceof Error ? error.message : String(error)}`, "stt");
-		if (recognitionWanted) scheduleRecognitionRestart(Math.max(750, recognitionRestartDelayMs));
+		recognitionWanted = false;
+		setPhase("idle");
+		log(`local STT start failed: ${error instanceof Error ? error.message : String(error)}`, "stt");
 	}
 }
 
 function stopRecognition(): void {
 	recognitionWanted = false;
-	if (recognitionRestartTimer) clearTimeout(recognitionRestartTimer);
-	recognitionRestartTimer = undefined;
-	recognition?.stop();
-	recognition = undefined;
+	micProcessor?.disconnect();
+	micProcessor = undefined;
+	micSource?.disconnect();
+	micSource = undefined;
+	for (const track of micStream?.getTracks() ?? []) track.stop();
+	micStream = undefined;
+	void micAudioContext?.close();
+	micAudioContext = undefined;
 	setPhase("idle");
+	log("local STT stopped", "stt");
 }
 
 function resetRecognitionAfterTts(): void {
 	ignoreMicUntil = Date.now() + 1500;
-	if (recognitionWanted && !recognition) scheduleRecognitionRestart(recognitionRestartDelayMs);
+	if (recognitionWanted) setPhase("listening");
 }
 
 function interruptTtsOnly(): void {
@@ -532,6 +447,14 @@ function finishTts(message: string): void {
 	log(message, "stt");
 }
 
+function selectedTtsProvider(): "elevenlabs" | "pocket" {
+	return ttsProviderControl.value === "pocket" ? "pocket" : "elevenlabs";
+}
+
+function ttsProviderLabel(provider: "elevenlabs" | "pocket"): string {
+	return provider === "pocket" ? "Pocket TTS" : "ElevenLabs pibot";
+}
+
 function speakGerman(text: string, requestId?: string): void {
 	const trimmed = text.trim();
 	if (!trimmed) {
@@ -540,64 +463,31 @@ function speakGerman(text: string, requestId?: string): void {
 	}
 
 	const generation = ++ttsGeneration;
+	const provider = selectedTtsProvider();
+	const providerLabel = ttsProviderLabel(provider);
 	activeSpeakRequestId = requestId;
 	clearCurrentTtsAudio();
 	setPhase("speaking");
 	ignoreMicUntil = Number.POSITIVE_INFINITY;
 
-	const audio = new Audio(`/api/tts?text=${encodeURIComponent(trimmed)}`);
+	const audio = new Audio(`/api/tts?provider=${encodeURIComponent(provider)}&text=${encodeURIComponent(trimmed)}`);
 	currentTtsAudio = audio;
-	createRobotEffect(audio);
-	audio.onplay = () => log(`ElevenLabs TTS playing full response ${trimmed.length} chars`, "stt");
+	createRobotVoiceEffect(audio);
+	audio.onplay = () => log(`${providerLabel} playing streamed response ${trimmed.length} chars`, "stt");
 	audio.onended = () => {
 		if (generation !== ttsGeneration) return;
-		finishTts("ElevenLabs TTS finished, resetting STT");
+		finishTts(`${providerLabel} finished, resetting STT`);
 	};
 	audio.onerror = () => {
 		if (generation !== ttsGeneration) return;
-		finishTts("ElevenLabs TTS failed, resetting STT");
+		finishTts(`${providerLabel} failed, resetting STT`);
 	};
 	audio.play().catch((error: unknown) => {
 		if (generation !== ttsGeneration) return;
-		finishTts(`ElevenLabs TTS play failed, resetting STT: ${error instanceof Error ? error.message : String(error)}`);
+		finishTts(
+			`${providerLabel} play failed, resetting STT: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	});
-}
-
-function handleRecognitionResult(event: SpeechRecognitionEvent): void {
-	let interim = "";
-	let final = "";
-	for (let i = event.resultIndex; i < event.results.length; i++) {
-		const text = event.results[i]?.[0]?.transcript ?? "";
-		if (event.results[i]?.isFinal) final += text;
-		else interim += text;
-	}
-
-	const heardText = `${interim} ${final}`;
-	if (micInputBlocked()) {
-		if (containsStopCommand(heardText)) {
-			log(`Stop detected during TTS/block: ${normalizeCommandText(heardText)}`, "stt");
-			interruptSpeech();
-		} else if (heardText.trim()) {
-			log(`Mic blocked, ignored: ${heardText.trim()}`, "stt");
-		}
-		return;
-	}
-
-	if (phase === "thinking") {
-		if (containsStopCommand(heardText)) {
-			log(`Stop detected while thinking: ${normalizeCommandText(heardText)}`, "stt");
-			interruptSpeech();
-		}
-		return;
-	}
-
-	if (interim) setRobotFaceState("hearing");
-	if (!final.trim()) return;
-
-	recognitionHadFinalResult = true;
-	log(`STT final: ${final}`, "stt");
-	setPhase("thinking");
-	send({ type: "stt", text: final, final: true });
 }
 
 let reloadVersion: string | undefined;
@@ -653,6 +543,28 @@ ws.onmessage = (event) => {
 	if (message.type === "speak_request") {
 		if (ttsEnabled) speakGerman(message.text, message.id);
 		else send({ type: "speak_done", id: message.id });
+	}
+	if (message.type === "stt_event") {
+		if (message.event === "loading") log("local STT loading Parakeet/Silero worker", "stt");
+		if (message.event === "ready") log("local STT worker ready", "stt");
+		if (message.event === "speech_start") {
+			setRobotFaceState("hearing");
+			log("STT speech started", "stt");
+		}
+		if (message.event === "speech_end") {
+			setPhase("thinking");
+			log("STT speech ended, transcribing", "stt");
+		}
+		if (message.event === "speech_drop") setPhase(recognitionWanted ? "listening" : "idle");
+		if (message.event === "error") {
+			setPhase("idle");
+			setRobotFaceState("error");
+			log(`STT error ${message.message ?? "unknown"}`, "stt");
+		}
+	}
+	if (message.type === "stt_final") {
+		log(`STT final: ${message.text || "-"}`, "stt");
+		if (!message.text.trim()) setPhase(recognitionWanted ? "listening" : "idle");
 	}
 	if (message.type === "agent_event") {
 		const agentEvent = message.event;
@@ -714,10 +626,8 @@ robotFace.onclick = () => {
 };
 
 micButton.onclick = () => {
-	recognitionWanted = true;
-	androidFastRecognitionEnds = 0;
-	log(`STT start requested; restartDelay=${recognitionRestartDelayMs}ms`, "stt");
-	startRecognition();
+	log("STT start requested: local Parakeet/Silero", "stt");
+	void startRecognition();
 };
 
 stopMicButton.onclick = stopRecognition;
@@ -733,12 +643,17 @@ enableCameraButton.onclick = async () => {
 
 if (cameraEnabled) void ensureCameraStream().catch(() => undefined);
 
+ttsProviderControl.onchange = () => {
+	localStorage.setItem(ttsProviderKey, selectedTtsProvider());
+	log(`TTS provider selected: ${ttsProviderLabel(selectedTtsProvider())}`, "stt");
+};
+
 testTtsButton.onclick = () => {
 	enableTts();
 	speakGerman("Hallo, ich bin dein kleiner Roboter. Die Sprachausgabe ist bereit.");
-	log("TTS enabled", "stt");
+	log(`TTS enabled: ${ttsProviderLabel(selectedTtsProvider())}`, "stt");
 };
 
 log(
-	"STT options: Web Speech API is quickest, but browser/cloud-backed and may stop after pauses. Later: native Android STT, Whisper streaming, or Vosk/Sherpa ONNX.",
+	"STT uses local Parakeet batch transcription with Silero VAD endpointing. TTS is switchable: ElevenLabs pibot or Kyutai Pocket.",
 );

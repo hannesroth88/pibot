@@ -42,6 +42,7 @@ async function stopServer() {
 	if (!server) return;
 	const child = server;
 	server = undefined;
+	if (child.exitCode !== null || child.signalCode !== null) return;
 	await new Promise((resolveStop) => {
 		const timeout = setTimeout(() => {
 			child.kill("SIGKILL");

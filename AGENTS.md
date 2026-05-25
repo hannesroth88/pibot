@@ -22,6 +22,7 @@
 ## Commands
 
 - After code changes, run `npm run check` and fix all errors, warnings, and infos.
+- Use `tmux` for every long-running process. Start the process in a named tmux session/window, keep logs visible in the pane, and observe it with tmux pane capture/tail instead of backgrounding with `nohup`.
 - Never run `npm run dev` or otherwise start the dev server unless the user explicitly asks; assume the user may already have it running in another terminal.
 - Do not run production builds or broad test suites unless requested.
 - For ad-hoc scripts, write them to `/tmp`, run them, then remove them. Do not embed multi-line scripts in `bash` commands.
