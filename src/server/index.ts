@@ -49,6 +49,12 @@ const websockets = createWebSocketServer({
 	onEvent: handleWebsocketEvent,
 });
 broadcast = websockets.broadcast;
+logSelectedModel();
+
+function logSelectedModel(): void {
+	const model = harness.model();
+	agentLogger.log(`using model ${model.provider}/${model.id} (${model.name}) context=${model.contextWindow}`);
+}
 
 function setRobotState(state: RobotState): void {
 	robotState = state;
@@ -207,6 +213,7 @@ async function abortRobotTurn(reason: string): Promise<void> {
 async function handleWebsocketEvent(event: WebsocketEvent): Promise<void> {
 	if (event.type === "client_connected") {
 		serverLogger.log("browser client connected");
+		logSelectedModel();
 		event.client.send(JSON.stringify({ type: "state", state: robotState }));
 		robot.setWebSocket(event.client);
 		logger.tag("robot").log("active robot client connected");

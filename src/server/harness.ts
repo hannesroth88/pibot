@@ -15,9 +15,43 @@ import type { RobotClient } from "./robot-client.js";
 import { createRobotTools, pruneImagesForContext } from "./tools/index.js";
 import type { MemoryStore } from "./tools/memory.js";
 
+const LOCAL_PROVIDER = "llama-cpp-qwen36";
+const LOCAL_MODEL_ID = "Qwen3.6-35B-A3B-UD-Q5_K_M.gguf";
+const LOCAL_API_KEY = "EMPTY";
+
+const localQwenModel = {
+	id: LOCAL_MODEL_ID,
+	name: "Qwen3.6 35B A3B Q5 llama.cpp Local",
+	api: "openai-completions",
+	provider: LOCAL_PROVIDER,
+	baseUrl: "http://127.0.0.1:8080/v1",
+	reasoning: false,
+	input: ["text", "image"],
+	cost: {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+	},
+	contextWindow: 131072,
+	maxTokens: 16384,
+	compat: {
+		supportsStore: false,
+		supportsDeveloperRole: false,
+		supportsReasoningEffort: false,
+		supportsUsageInStreaming: false,
+		supportsStrictMode: false,
+		maxTokensField: "max_tokens",
+	},
+} satisfies Model<"openai-completions">;
+
 function selectModel(): Model<Api> {
-	const provider = process.env.PI_PROVIDER ?? "anthropic";
-	const modelId = process.env.PI_MODEL ?? "claude-haiku-4-5";
+	const provider = process.env.PI_PROVIDER ?? LOCAL_PROVIDER;
+	const modelId = process.env.PI_MODEL ?? LOCAL_MODEL_ID;
+	if (provider === LOCAL_PROVIDER) {
+		if (modelId !== LOCAL_MODEL_ID) throw new Error(`Unknown PI_MODEL for ${provider}: ${modelId}`);
+		return localQwenModel;
+	}
 	if (!getProviders().includes(provider as KnownProvider)) throw new Error(`Unknown PI_PROVIDER: ${provider}`);
 	const models = getModels(provider as KnownProvider);
 	if (!models.some((model) => model.id === modelId)) throw new Error(`Unknown PI_MODEL for ${provider}: ${modelId}`);
@@ -57,6 +91,7 @@ export type RobotHarnessEvent =
 
 export interface RobotHarness {
 	current: () => AgentHarness;
+	model: () => Model<Api>;
 	rebuildSession: (reason: string) => Promise<void>;
 }
 
@@ -78,6 +113,7 @@ export async function createRobotHarness(deps: {
 			console.error(`[harness] event handler failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	};
+	const selectedModel = selectModel();
 	let harness = await buildHarness();
 
 	async function buildHarness(): Promise<AgentHarness> {
@@ -85,11 +121,13 @@ export async function createRobotHarness(deps: {
 		const newHarness = new AgentHarness({
 			env: deps.env,
 			session,
-			model: selectModel(),
+			model: selectedModel,
 			getApiKeyAndHeaders: async (model) => {
 				const envName = `${model.provider.toUpperCase()}_API_KEY`.replaceAll("-", "_");
 				const apiKey = process.env[envName] ?? process.env.OPENAI_API_KEY ?? process.env.ANTHROPIC_API_KEY;
-				return apiKey ? { apiKey } : undefined;
+				if (apiKey) return { apiKey };
+				if (model.provider === LOCAL_PROVIDER) return { apiKey: LOCAL_API_KEY };
+				return undefined;
 			},
 			tools,
 			systemPrompt: async () => buildSystemPrompt(deps.memoryStore),
@@ -116,6 +154,7 @@ export async function createRobotHarness(deps: {
 
 	return {
 		current: () => harness,
+		model: () => selectedModel,
 		rebuildSession: async (reason) => {
 			harness = await buildHarness();
 			await emit({ type: "session_reset", reason });
