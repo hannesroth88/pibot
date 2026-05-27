@@ -21,6 +21,7 @@ struct Config {
     min_utterance_ms: usize,
     interim_interval_ms: usize,
     interim_min_audio_ms: usize,
+    energy_gate: f32,
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -51,8 +52,9 @@ fn config() -> Result<Config, String> {
         speech_pad_ms: env_usize("PARAKEET_SPEECH_PAD_MS", 250),
         preroll_ms: env_usize("PARAKEET_PREROLL_MS", 1800),
         min_utterance_ms: env_usize("PARAKEET_MIN_UTTERANCE_MS", 450),
-        interim_interval_ms: env_usize("PARAKEET_INTERIM_INTERVAL_MS", 600),
+        interim_interval_ms: env_usize("PARAKEET_INTERIM_INTERVAL_MS", 0),
         interim_min_audio_ms: env_usize("PARAKEET_INTERIM_MIN_AUDIO_MS", 600),
+        energy_gate: env_f32("PARAKEET_ENERGY_GATE", 0.002),
     })
 }
 
@@ -158,6 +160,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "speechPadMs": cfg.speech_pad_ms,
         "prerollMs": cfg.preroll_ms,
         "interimIntervalMs": cfg.interim_interval_ms,
+        "energyGate": cfg.energy_gate,
     }));
 
     let preroll_chunks = (cfg.preroll_ms / VAD_CHUNK_MS).max(1);
@@ -182,7 +185,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         while pending.len() >= VAD_CHUNK_FRAMES {
             let chunk: Vec<f32> = pending.drain(..VAD_CHUNK_FRAMES).collect();
-            let speech_probability = vad.predict(chunk.iter().copied());
+            let chunk_energy = (chunk.iter().map(|sample| sample * sample).sum::<f32>()
+                / chunk.len() as f32)
+                .sqrt();
+            let speech_probability = if chunk_energy >= cfg.energy_gate {
+                vad.predict(chunk.iter().copied())
+            } else {
+                0.0
+            };
             let is_speech = speech_probability >= cfg.vad_threshold;
 
             preroll.push_back(chunk.clone());

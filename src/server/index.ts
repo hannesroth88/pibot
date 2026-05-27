@@ -3,6 +3,7 @@ import type { RobotState, ServerMessage } from "../types.js";
 import { serverConfig } from "./config.js";
 import { createRobotHarness, type RobotHarnessEvent } from "./harness.js";
 import { createHttpServer } from "./http-server.js";
+import { createLlamaService, defaultLlamaMmprojFile, defaultLlamaModelFile } from "./llama.js";
 import { createLogger, formatEntry } from "./logger.js";
 import { createFileMemoryStore } from "./memory-store.js";
 import { RobotClient } from "./robot-client.js";
@@ -28,6 +29,17 @@ const ttsLogger = logger.tag("tts");
 const executionEnv = new NodeExecutionEnv({ cwd: process.cwd() });
 const memoryStore = createFileMemoryStore(executionEnv, { path: serverConfig.memoryFile });
 const robot = new RobotClient();
+const llama = await createLlamaService({
+	cacheDir: serverConfig.pibotCacheDir,
+	modelDir: serverConfig.llamaModelDir,
+	modelFile: defaultLlamaModelFile,
+	mmprojFile: defaultLlamaMmprojFile,
+	baseUrl: serverConfig.llamaBaseUrl,
+	host: serverConfig.llamaHost,
+	port: serverConfig.llamaPort,
+	contextWindow: serverConfig.llamaContextWindow,
+	logger,
+});
 const tts = createTtsService({ qwen3WorkerPath: serverConfig.qwen3TtsWorkerPath, logger, onEvent: handleTtsEvent });
 const stt = createSttService({
 	workerBinaryPath: serverConfig.sttWorkerBinaryPath,
@@ -119,7 +131,7 @@ function submitPrompt(text: string): void {
 function handleSttEvent(event: SttEvent): void {
 	if (event.type === "ready") {
 		sttLogger.log(
-			`Parakeet ready sampleRate=${event.sampleRate} vadChunkMs=${event.vadChunkMs} threshold=${event.vadThreshold} minSilenceMs=${event.minSilenceMs} prerollMs=${event.prerollMs} interimIntervalMs=${event.interimIntervalMs ?? "off"}`,
+			`Parakeet ready sampleRate=${event.sampleRate} vadChunkMs=${event.vadChunkMs} threshold=${event.vadThreshold} energyGate=${event.energyGate ?? "off"} minSilenceMs=${event.minSilenceMs} prerollMs=${event.prerollMs} interimIntervalMs=${event.interimIntervalMs ?? "off"}`,
 		);
 		setRobotState({ phase: "listening" });
 	}
@@ -247,6 +259,7 @@ async function handleWebsocketEvent(event: WebsocketEvent): Promise<void> {
 onShutdown(async () => {
 	tts.stopChildProcess();
 	stt.stopChildProcess();
+	llama.stop();
 	robot.stop();
 	await logger.flush();
 });

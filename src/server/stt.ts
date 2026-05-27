@@ -26,6 +26,7 @@ export type SttEvent =
 			minSilenceMs: number;
 			prerollMs: number;
 			interimIntervalMs?: number;
+			energyGate?: number;
 	  }
 	| { type: "speech_start"; index: number }
 	| { type: "speech_end"; index: number; duration: number }
@@ -47,6 +48,7 @@ type SttWorkerMsg =
 			speechPadMs: number;
 			prerollMs: number;
 			interimIntervalMs?: number;
+			energyGate?: number;
 	  }
 	| { type: "speech_start"; index: number; time: number }
 	| { type: "speech_end"; index: number; duration: number }
@@ -188,6 +190,7 @@ export function createSttService(deps: SttServiceDeps): SttService {
 				minSilenceMs: message.minSilenceMs,
 				prerollMs: message.prerollMs,
 				interimIntervalMs: message.interimIntervalMs,
+				energyGate: message.energyGate,
 			});
 			return;
 		}
