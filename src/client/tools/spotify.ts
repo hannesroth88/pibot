@@ -290,9 +290,10 @@ export function createSpotifyTool(deps: {
 		const response = await fetch(`https://api.spotify.com/v1${path}`, { ...options, headers, signal });
 		if (response.status === 204) return undefined;
 		const text = await response.text();
-		const body = text ? (JSON.parse(text) as unknown) : undefined;
-		if (!response.ok) throw new Error(`Spotify API ${response.status}: ${JSON.stringify(body)}`);
-		return body as T;
+		const contentType = response.headers.get("content-type") ?? "";
+		const body = text && contentType.includes("application/json") ? (JSON.parse(text) as unknown) : undefined;
+		if (!response.ok) throw new Error(`Spotify API ${response.status}: ${body ? JSON.stringify(body) : text}`);
+		return body as T | undefined;
 	}
 
 	async function fetchProfile(signal?: AbortSignal): Promise<void> {

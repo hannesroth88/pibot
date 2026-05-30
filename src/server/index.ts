@@ -24,7 +24,6 @@ let ttsStartedForTurn = false;
 let speechPlaybackFinished: Promise<void> | undefined;
 let resolveSpeechPlaybackFinished: (() => void) | undefined;
 let bargeInActive = false;
-let activeToolCount = 0;
 let activeToolState: { name: string; args: unknown } | undefined;
 
 const logger = createLogger((entry) => {
@@ -208,7 +207,7 @@ function handleSttEvent(event: SttEvent): void {
 		}
 		if (bargeInActive) {
 			bargeInActive = false;
-			if (activeToolCount > 0) {
+			if (robotState.phase === "tool" || activeToolState) {
 				sttLogger.log(`ignored barge-in final while tool is active: ${JSON.stringify(event.text)}`);
 				if (activeToolState) {
 					setRobotState({
@@ -285,6 +284,10 @@ function sanitizeTextForTts(text: string): string {
 	return text.replace(/\p{Emoji_Presentation}|\p{Extended_Pictographic}|\uFE0F/gu, " ").replace(/\s+/g, " ");
 }
 
+function logToolResult(name: string, result: unknown): void {
+	if (name === "spotify_search") agentLogger.log(`spotify_search result ${JSON.stringify(result)}`);
+}
+
 function handleAssistantTextDelta(text: string): void {
 	activeAssistantText += text;
 	setRobotState({ phase: ttsStartedForTurn ? "speaking" : "thinking", assistantText: activeAssistantText });
@@ -300,9 +303,9 @@ function handleAssistantTextDelta(text: string): void {
 async function handleHarnessEvent(event: RobotHarnessEvent): Promise<void> {
 	if (bargeInActive) {
 		if (event.type === "tool_end") {
-			activeToolCount = Math.max(0, activeToolCount - 1);
-			if (activeToolCount === 0) activeToolState = undefined;
+			activeToolState = undefined;
 			agentLogger.log(`tool ${event.name} finished${event.isError ? " with error" : ""}`);
+			logToolResult(event.name, event.result);
 		}
 		if (event.type !== "tool_end") agentLogger.log(`ignored stale ${event.type} during barge-in`);
 		return;
@@ -315,18 +318,18 @@ async function handleHarnessEvent(event: RobotHarnessEvent): Promise<void> {
 	}
 	if (event.type === "assistant_delta") handleAssistantTextDelta(event.text);
 	if (event.type === "tool_start") {
-		activeToolCount++;
 		activeToolState = { name: event.name, args: event.args };
 		setRobotState({ phase: "tool", name: event.name, args: event.args, assistantText: assistantText() });
 		agentLogger.log(`tool ${event.name} ${JSON.stringify(event.args)}`);
 	}
 	if (event.type === "tool_end") {
-		activeToolCount = Math.max(0, activeToolCount - 1);
-		if (activeToolCount === 0) activeToolState = undefined;
+		activeToolState = undefined;
 		agentLogger.log(`tool ${event.name} finished${event.isError ? " with error" : ""}`);
+		logToolResult(event.name, event.result);
 	}
 	if (event.type === "assistant_end") {
 		if (event.text) agentLogger.log(`LLM: ${event.text}`);
+		else agentLogger.log("LLM: <empty assistant response>");
 		if (!activeAssistantText && event.text) handleAssistantTextDelta(event.text);
 		const tail = activeChunker?.flush();
 		if (tail) {
@@ -345,7 +348,6 @@ async function handleHarnessEvent(event: RobotHarnessEvent): Promise<void> {
 
 async function abortRobotTurn(reason: string): Promise<void> {
 	bargeInActive = false;
-	activeToolCount = 0;
 	activeToolState = undefined;
 	agentLogger.log(`abort: ${reason}`);
 	void robot.execute({ type: "cancel_speech", payload: { reason }, timeoutMs: 1000 }).catch(() => undefined);

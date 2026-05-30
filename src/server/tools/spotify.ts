@@ -10,11 +10,17 @@ const spotifySearchParameters = Type.Object({
 	query: Type.String({ description: "Spotify search query." }),
 	itemType: Type.Optional(
 		StringEnum([...spotifyItemTypes], {
-			description: "Spotify item type to search. Defaults to track.",
+			description:
+				"Spotify item type to search. Allowed values: track for songs/music tracks; album for music albums; playlist for playlists; show for podcasts/shows; episode for podcast episodes; audiobook for audiobooks. Do not use 'podcast' because Spotify's API type is 'show' or 'episode'. Defaults to track.",
 			default: "track",
 		}),
 	),
-	limit: Type.Optional(Type.Number({ description: "Number of results to return. Defaults to 5, maximum 10." })),
+	limit: Type.Optional(
+		Type.Number({
+			description:
+				"Number of results to return. Use at least 5 unless the user explicitly asks for fewer. Defaults to 5, maximum 10.",
+		}),
+	),
 });
 
 const spotifyPlayParameters = Type.Object({
@@ -59,7 +65,7 @@ export function createSpotifyTools(robot: RobotClient): AgentTool[] {
 		name: "spotify_search",
 		label: "Spotify Search",
 		description:
-			"Search Spotify for tracks, albums, playlists, podcasts, episodes, or audiobooks. Use this first when the requested item is ambiguous, then choose a returned spotify: URI for spotify_play.",
+			"Search Spotify. itemType must be one of: track, album, playlist, show, episode, audiobook. For podcasts use show; for podcast episodes use episode; never use podcast as an itemType. Request at least 5 results unless the user explicitly asks for fewer. Use this first when the requested item is ambiguous, then choose a returned spotify: URI for spotify_play.",
 		parameters: spotifySearchParameters,
 		executionMode: "sequential",
 		execute: async (_id, params, signal) => {

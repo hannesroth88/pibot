@@ -3,6 +3,10 @@ import type { RobotState } from "../types.js";
 export interface BargeInResult {
 	triggered: boolean;
 	preroll?: Int16Array;
+	metrics?: {
+		micRms: number;
+		residualRatio: number;
+	};
 }
 
 export class BargeInDetector {
@@ -18,10 +22,9 @@ export class BargeInDetector {
 
 	constructor(
 		targetSampleRate: number,
-		private readonly micThreshold = 0.012,
-		private readonly residualThreshold = 0.45,
-		private readonly triggerFrames = 3,
-		private readonly residualRmsThreshold = 0.008,
+		private readonly micThreshold = 0.018,
+		private readonly residualThreshold = 0.62,
+		private readonly triggerFrames = 5,
 	) {
 		this.micBufferRing = new Int16Array(targetSampleRate);
 	}
@@ -60,14 +63,12 @@ export class BargeInDetector {
 		if (!this.shouldBufferForBargeIn(state) || this.streaming) return { triggered: false };
 		const rms = this.micRms(input);
 		const ratio = state.phase === "tool" && !ttsSpeaking ? 1 : this.bargeResidualRatio(input, sampleRate);
-		const residualRms = rms * Math.sqrt(ratio);
-		const triggered =
-			(rms >= this.micThreshold && ratio >= this.residualThreshold) || residualRms >= this.residualRmsThreshold;
+		const triggered = rms >= this.micThreshold && ratio >= this.residualThreshold;
 		this.consecutiveFrames = triggered ? this.consecutiveFrames + 1 : Math.max(0, this.consecutiveFrames - 1);
 		if (this.consecutiveFrames < this.triggerFrames) return { triggered: false };
 		this.streaming = true;
 		this.consecutiveFrames = 0;
-		return { triggered: true, preroll: this.bufferedMicPcm() };
+		return { triggered: true, preroll: this.bufferedMicPcm(), metrics: { micRms: rms, residualRatio: ratio } };
 	}
 
 	shouldStreamMicNormally(state: RobotState): boolean {

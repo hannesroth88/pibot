@@ -202,7 +202,7 @@ robotServer = new RobotServer({
 	events: {
 		onState: (state) => {
 			serverRobotState = state;
-			if (state.phase === "listening" || state.phase === "inactive") bargeInDetector.resetStreaming();
+			if (state.phase !== "hearing") bargeInDetector.resetStreaming();
 			renderRobotFace();
 		},
 		onLog: (entry) => robotLog.appendLine(entry.origin, entry.tags, entry.message),
@@ -253,6 +253,12 @@ function sendMicAudio(input: Float32Array, sampleRate: number): void {
 	const pcm = resampleToPcm16(input, sampleRate);
 	const barge = bargeInDetector.observeMic(input, sampleRate, pcm, serverRobotState, ttsSpeaking);
 	if (barge.triggered) {
+		if (barge.metrics) {
+			log(
+				`barge metrics rms=${barge.metrics.micRms.toFixed(4)} residual=${barge.metrics.residualRatio.toFixed(3)}`,
+				"stt",
+			);
+		}
 		startBargeInStream(barge.preroll ?? new Int16Array());
 		return;
 	}
