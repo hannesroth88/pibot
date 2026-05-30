@@ -49,8 +49,8 @@ export type LocalLlmId = keyof typeof localLlmConfigs;
 
 export function parseLocalLlmId(value: string | undefined): LocalLlmId {
 	const normalized = value?.toLowerCase();
-	if (!normalized || normalized === "qwen") return "qwen";
-	if (normalized === "gemma") return "gemma";
+	if (!normalized || normalized === "gemma") return "gemma";
+	if (normalized === "qwen") return "qwen";
 	throw new Error(`Unknown LOCAL_LLM: ${value}. Expected qwen or gemma.`);
 }
 

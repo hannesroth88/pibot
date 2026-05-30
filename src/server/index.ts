@@ -171,7 +171,7 @@ function handleSttEvent(event: SttEvent): void {
 		sttLogger.log(
 			`interim #${event.index} audioMs=${event.audioMs} windowMs=${event.windowMs ?? "full"} decodeMs=${event.decodeMs} text=${JSON.stringify(event.text)}`,
 		);
-		if (event.text && looksLikeStopCommand(event.text) && stoppedUtteranceIndex !== event.index) {
+		if (speechActive && event.text && looksLikeStopCommand(event.text) && stoppedUtteranceIndex !== event.index) {
 			stoppedUtteranceIndex = event.index;
 			sttLogger.log("stop-word detected in interim");
 			void abortRobotTurn(`interim stop word: ${event.text}`);
@@ -181,7 +181,7 @@ function handleSttEvent(event: SttEvent): void {
 	if (event.type === "final") {
 		sttLogger.log(`final #${event.index} decodeMs=${event.decodeMs} text=${JSON.stringify(event.text)}`);
 		if (stoppedUtteranceIndex === event.index) return;
-		if (event.text && looksLikeStopCommand(event.text)) {
+		if (speechActive && event.text && looksLikeStopCommand(event.text)) {
 			stoppedUtteranceIndex = event.index;
 			sttLogger.log("stop-word detected in final");
 			void abortRobotTurn(`final stop word: ${event.text}`);
@@ -337,7 +337,7 @@ async function handleWebsocketEvent(event: WebsocketEvent): Promise<void> {
 			await harness.rebuildSession("client request");
 		}
 	}
-	if (event.type === "audio_frame") stt.handleAudioFrame(event.data);
+	if (event.type === "audio_frame" && !speechActive) stt.handleAudioFrame(event.data);
 }
 
 onShutdown(async () => {

@@ -165,6 +165,7 @@ export class RobotServer {
 	): Promise<RobotRpcMap[RobotRpcType]["response"]> {
 		if (message.request.type === "take_photo") return await this.tools.take_photo(message.request.payload, signal);
 		if (message.request.type === "motor") return await this.tools.motor(message.request.payload, signal);
+		if (message.request.type === "spotify") return await this.tools.spotify(message.request.payload, signal);
 		if (message.request.type === "speak") return await this.tools.speak(message.request.payload, signal);
 		return await this.tools.cancel_speech(message.request.payload, signal);
 	}
@@ -193,6 +194,10 @@ export class RobotServer {
 			return;
 		}
 		if (requestType === "speak") {
+			this.send({ type: "robot_response", id, requestType, error });
+			return;
+		}
+		if (requestType === "spotify") {
 			this.send({ type: "robot_response", id, requestType, error });
 			return;
 		}

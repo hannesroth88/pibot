@@ -5,7 +5,10 @@ import "./components/robot-log.js";
 import type { RobotLogElement } from "./components/robot-log.js";
 import "./components/setup-panel.js";
 import type { RobotSetupPanelElement } from "./components/setup-panel.js";
+import "./components/spotify-panel.js";
 
+import type { SpotifyNowPlaying } from "../types.js";
+import type { SpotifyPanelElement } from "./components/spotify-panel.js";
 import { BrowserClientLogger } from "./logger.js";
 import { RobotServer } from "./robot-server.js";
 import { createRobotTools } from "./tools/index.js";
@@ -17,15 +20,29 @@ const logEl = document.querySelector<RobotLogElement>("#log");
 const face = document.querySelector<RobotFaceElement>("#face");
 const setupFaceHost = document.querySelector<HTMLElement>("#setupFaceHost");
 const setupPanel = document.querySelector<RobotSetupPanelElement>("#setupPanel");
+const spotifyPanel = document.querySelector<SpotifyPanelElement>("#spotifyPanel");
+const spotifyNowPlaying = document.querySelector<HTMLElement>("#spotifyNowPlaying");
 const backButton = document.querySelector<HTMLButtonElement>("#back");
 
-if (!setup || !robot || !logEl || !face || !setupFaceHost || !setupPanel || !backButton) {
+if (
+	!setup ||
+	!robot ||
+	!logEl ||
+	!face ||
+	!setupFaceHost ||
+	!setupPanel ||
+	!spotifyPanel ||
+	!spotifyNowPlaying ||
+	!backButton
+) {
 	throw new Error("Missing required DOM elements");
 }
 
 const robotLog = logEl;
 const robotFace = face;
 const setupPanelElement = setupPanel;
+const spotifyPanelElement = spotifyPanel;
+const spotifyNowPlayingElement = spotifyNowPlaying;
 const setupSection = setup;
 const robotSection = robot;
 const setupFaceHostElement = setupFaceHost;
@@ -47,9 +64,9 @@ const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
 const targetSttSampleRate = 16000;
 type ExtendedMicAudioConstraints = MediaTrackConstraints & { latency?: ConstrainDouble };
 const micAudioConstraints: ExtendedMicAudioConstraints = {
-	echoCancellation: { ideal: true },
-	noiseSuppression: { ideal: true },
-	autoGainControl: { ideal: true },
+	echoCancellation: { ideal: false },
+	noiseSuppression: { ideal: false },
+	autoGainControl: { ideal: false },
 	channelCount: { ideal: 1 },
 	sampleRate: { ideal: 48000 },
 	latency: { ideal: 0.02 },
@@ -140,7 +157,35 @@ function setMicInputBlockedUntil(time: number): void {
 	ignoreMicUntil = time;
 }
 
-const tools = createRobotTools({
+let tools: ReturnType<typeof createRobotTools>;
+
+function renderSpotifyNowPlaying(playback: SpotifyNowPlaying | undefined): void {
+	spotifyNowPlayingElement.hidden = !playback?.title;
+	spotifyNowPlayingElement.replaceChildren();
+	if (!playback?.title) return;
+	if (playback.coverUrl) {
+		const image = document.createElement("img");
+		image.src = playback.coverUrl;
+		image.alt = "Spotify cover";
+		spotifyNowPlayingElement.append(image);
+	}
+	const text = document.createElement("div");
+	const title = document.createElement("strong");
+	title.textContent = playback.title;
+	text.append(title);
+	if (playback.subtitle) {
+		const subtitle = document.createElement("span");
+		subtitle.textContent = playback.subtitle;
+		text.append(subtitle);
+	}
+	spotifyNowPlayingElement.append(text);
+}
+
+function updateSpotifyPanel(): void {
+	spotifyPanelElement.status = tools.spotify.getStatus();
+}
+
+tools = createRobotTools({
 	logger: clientLogger,
 	face: robotFace,
 	setPhase,
@@ -148,7 +193,22 @@ const tools = createRobotTools({
 	resetRecognitionAfterTts,
 	setMicInputBlockedUntil,
 	onSpeakingChange: setTtsSpeaking,
+	onSpotifyPlaybackChange: renderSpotifyNowPlaying,
+	onSpotifyStatusChange: updateSpotifyPanel,
 });
+updateSpotifyPanel();
+void tools.spotify
+	.handleRedirectCallback()
+	.then((connected) => {
+		updateSpotifyPanel();
+		if (!connected) return;
+		spotifyPanelElement.hidden = false;
+		void tools.spotify
+			.loadDevices()
+			.then(updateSpotifyPanel)
+			.catch((error: unknown) => log(`Spotify devices failed: ${stringifyLogValue(error)}`, "spotify"));
+	})
+	.catch((error: unknown) => log(`Spotify auth failed: ${stringifyLogValue(error)}`, "spotify"));
 
 robotServer = new RobotServer({
 	url: `${wsProtocol}://${location.host}`,
@@ -194,7 +254,14 @@ function resampleToPcm16(input: Float32Array, inputSampleRate: number): Int16Arr
 }
 
 function sendMicAudio(input: Float32Array, sampleRate: number): void {
-	if (!recognitionWanted || !robotServer.isOpen() || micInputBlocked()) return;
+	if (
+		!recognitionWanted ||
+		!robotServer.isOpen() ||
+		micInputBlocked() ||
+		ttsSpeaking ||
+		serverRobotState.phase === "speaking"
+	)
+		return;
 	const pcm = resampleToPcm16(input, sampleRate);
 	const buffer = new ArrayBuffer(pcm.byteLength);
 	new Uint8Array(buffer).set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength));
@@ -338,6 +405,48 @@ async function startRobot(): Promise<void> {
 }
 
 setupPanelElement.addEventListener("start-robot", () => void startRobot());
+setupPanelElement.addEventListener("spotify-setup", () => {
+	spotifyPanelElement.hidden = false;
+	updateSpotifyPanel();
+	if (tools.spotify.getStatus().connected) {
+		void tools.spotify
+			.loadDevices()
+			.then(updateSpotifyPanel)
+			.catch((error: unknown) => log(`Spotify devices failed: ${stringifyLogValue(error)}`, "spotify"));
+	}
+});
+spotifyPanelElement.addEventListener("spotify-close", () => {
+	spotifyPanelElement.hidden = true;
+});
+spotifyPanelElement.addEventListener("spotify-client-id", (event) => {
+	const detail = (event as CustomEvent<{ clientId: string }>).detail;
+	tools.spotify.setClientId(detail.clientId);
+});
+spotifyPanelElement.addEventListener("spotify-connect", () => {
+	void tools.spotify
+		.login()
+		.catch((error: unknown) => log(`Spotify login failed: ${stringifyLogValue(error)}`, "spotify"));
+});
+spotifyPanelElement.addEventListener("spotify-disconnect", () => {
+	tools.spotify.disconnect();
+	updateSpotifyPanel();
+});
+spotifyPanelElement.addEventListener("spotify-refresh-devices", () => {
+	void tools.spotify
+		.loadDevices()
+		.then(updateSpotifyPanel)
+		.catch((error: unknown) => log(`Spotify devices failed: ${stringifyLogValue(error)}`, "spotify"));
+});
+spotifyPanelElement.addEventListener("spotify-device", (event) => {
+	const detail = (event as CustomEvent<{ deviceId?: string }>).detail;
+	tools.spotify.selectDevice(detail.deviceId);
+});
+spotifyPanelElement.addEventListener("spotify-browser-player", () => {
+	void tools.spotify
+		.startBrowserPlayer()
+		.then(updateSpotifyPanel)
+		.catch((error: unknown) => log(`Spotify browser player failed: ${stringifyLogValue(error)}`, "spotify"));
+});
 
 backButton.onclick = async () => {
 	robot.hidden = true;

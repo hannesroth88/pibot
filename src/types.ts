@@ -1,5 +1,39 @@
 export type MotorCommand = "forward" | "turn_left" | "turn_left_degrees" | "stop";
 
+export type SpotifyItemType = "track" | "album" | "playlist" | "audiobook" | "show" | "episode";
+export type SpotifyAction = "search" | "play" | "pause" | "resume" | "next" | "current";
+export type SpotifyControlAction = "pause" | "resume" | "next" | "current";
+
+export interface SpotifyNowPlaying {
+	title?: string;
+	subtitle?: string;
+	uri?: string;
+	coverUrl?: string;
+	isPlaying?: boolean;
+}
+
+export interface SpotifySearchResult extends SpotifyNowPlaying {
+	type: SpotifyItemType;
+	uri: string;
+}
+
+export interface SpotifyDeviceInfo {
+	id: string;
+	name: string;
+	type: string;
+	isActive: boolean;
+}
+
+export type SpotifyRpcRequest =
+	| { action: "search"; query: string; itemType?: SpotifyItemType; limit?: number }
+	| { action: "play"; uri: string }
+	| { action: SpotifyControlAction };
+
+export type SpotifyRpcResponse =
+	| { ok: true; action: "search"; results: SpotifySearchResult[] }
+	| ({ ok: true; action: Exclude<SpotifyAction, "search"> } & SpotifyNowPlaying)
+	| { ok: false; error: string };
+
 export type LogOrigin = "server" | "client";
 
 export interface LogEntry {
@@ -35,6 +69,10 @@ export interface RobotRpcMap {
 	motor: {
 		request: { command: MotorCommand; durationMs: number; degrees?: number };
 		response: { ok: true } | { ok: false; error: string };
+	};
+	spotify: {
+		request: SpotifyRpcRequest;
+		response: SpotifyRpcResponse;
 	};
 	speak: {
 		request: { url: string; text: string };

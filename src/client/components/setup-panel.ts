@@ -2,6 +2,7 @@ export type SetupPanelMode = "idle" | "starting" | "started";
 
 export class RobotSetupPanelElement extends HTMLElement {
 	private startButton: HTMLButtonElement | undefined;
+	private spotifyButton: HTMLButtonElement | undefined;
 	private resetButton: HTMLButtonElement | undefined;
 
 	connectedCallback(): void {
@@ -24,10 +25,13 @@ export class RobotSetupPanelElement extends HTMLElement {
 
 		const controls = document.createElement("div");
 		controls.className = "controls";
+		this.spotifyButton = document.createElement("button");
+		this.spotifyButton.textContent = "Spotify";
+		this.spotifyButton.addEventListener("click", () => this.dispatchEvent(new Event("spotify-setup")));
 		this.resetButton = document.createElement("button");
 		this.resetButton.textContent = "Reset session";
 		this.resetButton.addEventListener("click", () => this.dispatchEvent(new Event("reset-session")));
-		controls.append(this.resetButton);
+		controls.append(this.spotifyButton, this.resetButton);
 		this.replaceChildren(this.startButton, controls);
 	}
 }
