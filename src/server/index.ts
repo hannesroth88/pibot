@@ -337,7 +337,7 @@ async function handleWebsocketEvent(event: WebsocketEvent): Promise<void> {
 			await harness.rebuildSession("client request");
 		}
 	}
-	if (event.type === "audio_frame" && !speechActive) stt.handleAudioFrame(event.data);
+	if (event.type === "audio_frame") stt.handleAudioFrame(event.data);
 }
 
 onShutdown(async () => {

@@ -64,7 +64,7 @@ const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
 const targetSttSampleRate = 16000;
 type ExtendedMicAudioConstraints = MediaTrackConstraints & { latency?: ConstrainDouble };
 const micAudioConstraints: ExtendedMicAudioConstraints = {
-	echoCancellation: { ideal: false },
+	echoCancellation: { ideal: true },
 	noiseSuppression: { ideal: false },
 	autoGainControl: { ideal: false },
 	channelCount: { ideal: 1 },
@@ -254,14 +254,7 @@ function resampleToPcm16(input: Float32Array, inputSampleRate: number): Int16Arr
 }
 
 function sendMicAudio(input: Float32Array, sampleRate: number): void {
-	if (
-		!recognitionWanted ||
-		!robotServer.isOpen() ||
-		micInputBlocked() ||
-		ttsSpeaking ||
-		serverRobotState.phase === "speaking"
-	)
-		return;
+	if (!recognitionWanted || !robotServer.isOpen() || micInputBlocked()) return;
 	const pcm = resampleToPcm16(input, sampleRate);
 	const buffer = new ArrayBuffer(pcm.byteLength);
 	new Uint8Array(buffer).set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength));
