@@ -2,12 +2,16 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, rename, stat, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { Logger } from "./logger.js";
 
 export interface SttServiceDeps {
+	workerKind: string;
 	workerBinaryPath: string;
 	modelDir: string;
+	parakeetCppWorkerPath: string;
+	parakeetCppModelPath: string;
+	sileroVadGgmlModelPath: string;
 	logger: Logger;
 	onEvent: (event: SttEvent) => void;
 }
@@ -39,6 +43,8 @@ export type SttEvent =
 
 const PARAKEET_TDT_REPO = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main";
 const PARAKEET_TDT_FILES = ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx", "vocab.txt"] as const;
+const PARAKEET_CPP_REPO = "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main";
+const WHISPER_VAD_REPO = "https://huggingface.co/ggml-org/whisper-vad/resolve/main";
 
 type SttWorkerMsg =
 	| {
@@ -97,10 +103,16 @@ export function createSttService(deps: SttServiceDeps): SttService {
 		if (childProcess && !childProcess.killed) return;
 		stdout = "";
 		const command = workerCommand();
-		await ensureModelFiles();
-		logger.log("loading Rust Parakeet/Silero worker");
+		if (deps.workerKind === "parakeet-cpp") await ensureParakeetCppModelFile();
+		else await ensureModelFiles();
+		logger.log(`loading ${deps.workerKind} STT worker`);
 		const child = spawn(command.file, command.args, {
-			env: { ...process.env, PARAKEET_TDT_MODEL_DIR: deps.modelDir },
+			env: {
+				...process.env,
+				PARAKEET_TDT_MODEL_DIR: deps.modelDir,
+				PARAKEET_CPP_MODEL_PATH: deps.parakeetCppModelPath,
+				SILERO_VAD_GGML_MODEL_PATH: deps.sileroVadGgmlModelPath,
+			},
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		childProcess = child;
@@ -109,15 +121,36 @@ export function createSttService(deps: SttServiceDeps): SttService {
 		child.once("error", (error) => emit({ type: "error", message: error.message }));
 		child.once("exit", (code, signal) => {
 			if (childProcess === child) childProcess = undefined;
-			logger.log(`Rust Parakeet worker exited code=${code ?? "none"} signal=${signal ?? "none"}`);
+			logger.log(`${deps.workerKind} STT worker exited code=${code ?? "none"} signal=${signal ?? "none"}`);
 		});
 	}
 
 	function workerCommand(): { file: string; args: string[] } {
+		if (deps.workerKind === "parakeet-cpp") {
+			if (!existsSync(deps.parakeetCppWorkerPath)) {
+				throw new Error(
+					`parakeet.cpp STT worker missing: ${deps.parakeetCppWorkerPath}. Run npm run build:stt-parakeet-cpp.`,
+				);
+			}
+			return { file: deps.parakeetCppWorkerPath, args: [deps.parakeetCppModelPath, deps.sileroVadGgmlModelPath] };
+		}
 		if (!existsSync(deps.workerBinaryPath)) {
 			throw new Error(`Rust STT worker binary missing: ${deps.workerBinaryPath}. Run npm run build:stt-rust.`);
 		}
 		return { file: deps.workerBinaryPath, args: [deps.modelDir] };
+	}
+
+	async function ensureParakeetCppModelFile(): Promise<void> {
+		if (!(await hasUsableFile(deps.parakeetCppModelPath))) {
+			await mkdir(dirname(deps.parakeetCppModelPath), { recursive: true });
+			const file = basename(deps.parakeetCppModelPath);
+			await downloadFile(`${PARAKEET_CPP_REPO}/${file}`, file, deps.parakeetCppModelPath);
+		}
+		if (!(await hasUsableFile(deps.sileroVadGgmlModelPath))) {
+			await mkdir(dirname(deps.sileroVadGgmlModelPath), { recursive: true });
+			const file = basename(deps.sileroVadGgmlModelPath);
+			await downloadFile(`${WHISPER_VAD_REPO}/${file}`, file, deps.sileroVadGgmlModelPath);
+		}
 	}
 
 	async function ensureModelFiles(): Promise<void> {
@@ -138,10 +171,14 @@ export function createSttService(deps: SttServiceDeps): SttService {
 	}
 
 	async function downloadModelFile(file: string, path: string): Promise<void> {
+		return downloadFile(`${PARAKEET_TDT_REPO}/${file}`, file, path);
+	}
+
+	async function downloadFile(url: string, file: string, path: string): Promise<void> {
 		const tmpPath = `${path}.tmp-${process.pid}`;
 		await unlink(tmpPath).catch(() => undefined);
 		logger.log(`downloading STT model file ${file}`);
-		const response = await fetch(`${PARAKEET_TDT_REPO}/${file}`);
+		const response = await fetch(url);
 		if (!response.ok || !response.body) throw new Error(`failed to download ${file}: HTTP ${response.status}`);
 		const total = Number(response.headers.get("content-length") ?? "0");
 		const reader = response.body.getReader();

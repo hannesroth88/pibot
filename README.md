@@ -41,9 +41,18 @@ Pipi runs local LLM, STT, and TTS models. Missing default models are downloaded 
   - Downloaded into: `~/models/gemma-4-26b-a4b-it`
   - Pipi also downloads a pinned llama.cpp release into `~/.cache/pibot/llama.cpp`.
 
-- STT: Parakeet TDT 0.6B int8 ONNX with Silero VAD.
-  - Model: `istupakov/parakeet-tdt-0.6b-v3-onnx`
-  - Downloaded into: `~/models/parakeet-tdt-0.6b-v3-onnx-int8`
+- STT default: native `parakeet.cpp` GGUF worker with whisper.cpp GGML Silero VAD.
+  - Build with `npm run build:stt-parakeet-cpp`.
+  - Model: `mudler/parakeet-cpp-gguf/tdt-0.6b-v3-q8_0.gguf`.
+  - Downloaded into: `~/models/parakeet-cpp-gguf/tdt-0.6b-v3-q8_0.gguf`.
+  - VAD model: `ggml-org/whisper-vad/ggml-silero-v6.2.0.bin`.
+  - Downloaded into: `~/models/whisper-vad/ggml-silero-v6.2.0.bin`.
+  - Override with `PARAKEET_CPP_MODEL_PATH`/`PARAKEET_CPP_MODEL_FILE` and `SILERO_VAD_GGML_MODEL_PATH`/`SILERO_VAD_GGML_MODEL_FILE`.
+
+- STT legacy: Parakeet TDT 0.6B int8 ONNX with Silero VAD.
+  - Run with `STT_WORKER=onnx npm run dev`.
+  - Model: `istupakov/parakeet-tdt-0.6b-v3-onnx`.
+  - Downloaded into: `~/models/parakeet-tdt-0.6b-v3-onnx-int8`.
 
 - TTS: Qwen3-TTS 0.6B Base 6-bit MLX.
   - Model: `mlx-community/Qwen3-TTS-12Hz-0.6B-Base-6bit`
@@ -55,6 +64,7 @@ Pipi runs local LLM, STT, and TTS models. Missing default models are downloaded 
 npm run dev             # start the development server
 npm run build:native    # build STT and TTS native workers
 npm run build:stt-rust  # build only the Rust STT worker
+npm run build:stt-parakeet-cpp # build the native parakeet.cpp STT worker
 npm run build:tts-rust  # build only the Rust Qwen3-TTS worker
 npm run check           # format/lint/typecheck/build client
 npm run bench:stt       # benchmark STT worker

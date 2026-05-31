@@ -11,10 +11,23 @@ export const serverConfig = {
 	pibotCacheDir: process.env.PIBOT_CACHE_DIR ?? resolve(homedir(), ".cache/pibot"),
 	port: Number(process.env.PORT ?? 8010),
 	host: process.env.HOST ?? "127.0.0.1",
+	sttWorker: process.env.STT_WORKER ?? "parakeet-cpp",
 	sttWorkerBinaryPath: resolve(
 		serverDir,
 		`../../native/pibot-stt/target/release/pibot-stt-worker${process.platform === "win32" ? ".exe" : ""}`,
 	),
+	parakeetCppWorkerPath:
+		process.env.PARAKEET_CPP_WORKER_PATH ??
+		resolve(
+			serverDir,
+			`../../native/parakeet-cpp-stt/build/parakeet-cpp-stt-worker${process.platform === "win32" ? ".exe" : ""}`,
+		),
+	parakeetCppModelPath:
+		process.env.PARAKEET_CPP_MODEL_PATH ??
+		resolve(homedir(), "models/parakeet-cpp-gguf", process.env.PARAKEET_CPP_MODEL_FILE ?? "tdt-0.6b-v3-q8_0.gguf"),
+	sileroVadGgmlModelPath:
+		process.env.SILERO_VAD_GGML_MODEL_PATH ??
+		resolve(homedir(), "models/whisper-vad", process.env.SILERO_VAD_GGML_MODEL_FILE ?? "ggml-silero-v6.2.0.bin"),
 	parakeetTdtModelDir:
 		process.env.PARAKEET_TDT_MODEL_DIR ?? resolve(homedir(), "models/parakeet-tdt-0.6b-v3-onnx-int8"),
 	llamaBaseUrl: process.env.LLAMA_BASE_URL ?? "http://127.0.0.1:8080/v1",

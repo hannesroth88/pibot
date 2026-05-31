@@ -11,8 +11,9 @@
 		"compile:client": "esbuild src/client/index.ts --bundle --format=esm --target=es2022 --outfile=public/app.js",
 		"submodules": "git submodule update --init --recursive",
 		"build:stt-rust": "cargo build --release --manifest-path native/pibot-stt/Cargo.toml",
+		"build:stt-parakeet-cpp": "cmake -S native/parakeet-cpp-stt -B native/parakeet-cpp-stt/build && cmake --build native/parakeet-cpp-stt/build -j",
 		"build:tts-rust": "npm run submodules -- native/qwen3_tts_rs && cargo build --release --no-default-features --features mlx --manifest-path native/qwen3_tts_rs/Cargo.toml --bin pibot-tts-worker",
-		"build:native": "npm run build:stt-rust && npm run build:tts-rust",
+		"build:native": "npm run build:stt-parakeet-cpp && npm run build:stt-rust && npm run build:tts-rust",
 		"check": "biome check --write --error-on-warnings . && tsc --noEmit && npm run compile:client",
 		"typecheck": "tsc --noEmit",
 		"prepare": "husky"

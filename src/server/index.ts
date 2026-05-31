@@ -61,8 +61,12 @@ const tts = createTtsService({
 	logger,
 });
 const stt = createSttService({
+	workerKind: serverConfig.sttWorker,
 	workerBinaryPath: serverConfig.sttWorkerBinaryPath,
 	modelDir: serverConfig.parakeetTdtModelDir,
+	parakeetCppWorkerPath: serverConfig.parakeetCppWorkerPath,
+	parakeetCppModelPath: serverConfig.parakeetCppModelPath,
+	sileroVadGgmlModelPath: serverConfig.sileroVadGgmlModelPath,
 	logger,
 	onEvent: handleSttEvent,
 });
