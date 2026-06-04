@@ -2,13 +2,10 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, rename, stat, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname } from "node:path";
 import type { Logger } from "./logger.js";
 
 export interface SttServiceDeps {
-	workerKind: string;
-	workerBinaryPath: string;
-	modelDir: string;
 	parakeetCppWorkerPath: string;
 	parakeetCppModelPath: string;
 	sileroVadGgmlModelPath: string;
@@ -17,7 +14,8 @@ export interface SttServiceDeps {
 }
 
 export interface SttService {
-	handleAudioFrame: (data: Buffer) => void;
+	handleAudioFrame: (userId: string, data: Buffer) => void;
+	closeUser: (userId: string) => void;
 	stopChildProcess: () => void;
 }
 
@@ -34,17 +32,25 @@ export type SttEvent =
 			interimWindowMs?: number;
 			energyGate?: number;
 	  }
-	| { type: "speech_start"; index: number }
-	| { type: "speech_end"; index: number; duration: number }
-	| { type: "speech_drop"; index: number; duration: number; reason: string }
-	| { type: "interim"; index: number; text: string; audioMs: number; windowMs?: number; decodeMs: number }
-	| { type: "final"; index: number; text: string; decodeMs: number }
-	| { type: "error"; message: string };
+	| { type: "speech_start"; userId: string; index: number }
+	| { type: "speech_end"; userId: string; index: number; duration: number }
+	| { type: "speech_drop"; userId: string; index: number; duration: number; reason: string }
+	| {
+			type: "interim";
+			userId: string;
+			index: number;
+			text: string;
+			audioMs: number;
+			windowMs?: number;
+			decodeMs: number;
+	  }
+	| { type: "final"; userId: string; index: number; text: string; decodeMs: number }
+	| { type: "error"; userId?: string; message: string };
 
-const PARAKEET_TDT_REPO = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main";
-const PARAKEET_TDT_FILES = ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx", "vocab.txt"] as const;
 const PARAKEET_CPP_REPO = "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main";
 const WHISPER_VAD_REPO = "https://huggingface.co/ggml-org/whisper-vad/resolve/main";
+const sttInputAudioFrame = 1;
+const sttInputCloseUser = 2;
 
 type SttWorkerMsg =
 	| {
@@ -60,12 +66,20 @@ type SttWorkerMsg =
 			interimWindowMs?: number;
 			energyGate?: number;
 	  }
-	| { type: "speech_start"; index: number; time: number }
-	| { type: "speech_end"; index: number; duration: number }
-	| { type: "speech_drop"; index: number; duration: number; reason: string }
-	| { type: "interim"; index: number; text: string; audioMs: number; windowMs?: number; decodeMs: number }
-	| { type: "final"; index: number; text: string; duration: number; decodeMs: number }
-	| { type: "error"; message: string };
+	| { type: "speech_start"; userId: string; index: number; time: number }
+	| { type: "speech_end"; userId: string; index: number; duration: number }
+	| { type: "speech_drop"; userId: string; index: number; duration: number; reason: string }
+	| {
+			type: "interim";
+			userId: string;
+			index: number;
+			text: string;
+			audioMs: number;
+			windowMs?: number;
+			decodeMs: number;
+	  }
+	| { type: "final"; userId: string; index: number; text: string; duration: number; decodeMs: number }
+	| { type: "error"; userId?: string; message: string };
 
 function streamLines(stream: NodeJS.ReadableStream | null | undefined, onLine: (line: string) => void): void {
 	if (!stream) return;
@@ -103,13 +117,11 @@ export function createSttService(deps: SttServiceDeps): SttService {
 		if (childProcess && !childProcess.killed) return;
 		stdout = "";
 		const command = workerCommand();
-		if (deps.workerKind === "parakeet-cpp") await ensureParakeetCppModelFile();
-		else await ensureModelFiles();
-		logger.log(`loading ${deps.workerKind} STT worker`);
+		await ensureModelFiles();
+		logger.log("loading parakeet.cpp STT worker");
 		const child = spawn(command.file, command.args, {
 			env: {
 				...process.env,
-				PARAKEET_TDT_MODEL_DIR: deps.modelDir,
 				PARAKEET_CPP_MODEL_PATH: deps.parakeetCppModelPath,
 				SILERO_VAD_GGML_MODEL_PATH: deps.sileroVadGgmlModelPath,
 			},
@@ -121,26 +133,20 @@ export function createSttService(deps: SttServiceDeps): SttService {
 		child.once("error", (error) => emit({ type: "error", message: error.message }));
 		child.once("exit", (code, signal) => {
 			if (childProcess === child) childProcess = undefined;
-			logger.log(`${deps.workerKind} STT worker exited code=${code ?? "none"} signal=${signal ?? "none"}`);
+			logger.log(`parakeet.cpp STT worker exited code=${code ?? "none"} signal=${signal ?? "none"}`);
 		});
 	}
 
 	function workerCommand(): { file: string; args: string[] } {
-		if (deps.workerKind === "parakeet-cpp") {
-			if (!existsSync(deps.parakeetCppWorkerPath)) {
-				throw new Error(
-					`parakeet.cpp STT worker missing: ${deps.parakeetCppWorkerPath}. Run npm run build:stt-parakeet-cpp.`,
-				);
-			}
-			return { file: deps.parakeetCppWorkerPath, args: [deps.parakeetCppModelPath, deps.sileroVadGgmlModelPath] };
+		if (!existsSync(deps.parakeetCppWorkerPath)) {
+			throw new Error(
+				`parakeet.cpp STT worker missing: ${deps.parakeetCppWorkerPath}. Run npm run build:stt-parakeet-cpp.`,
+			);
 		}
-		if (!existsSync(deps.workerBinaryPath)) {
-			throw new Error(`Rust STT worker binary missing: ${deps.workerBinaryPath}. Run npm run build:stt-rust.`);
-		}
-		return { file: deps.workerBinaryPath, args: [deps.modelDir] };
+		return { file: deps.parakeetCppWorkerPath, args: [deps.parakeetCppModelPath, deps.sileroVadGgmlModelPath] };
 	}
 
-	async function ensureParakeetCppModelFile(): Promise<void> {
+	async function ensureModelFiles(): Promise<void> {
 		if (!(await hasUsableFile(deps.parakeetCppModelPath))) {
 			await mkdir(dirname(deps.parakeetCppModelPath), { recursive: true });
 			const file = basename(deps.parakeetCppModelPath);
@@ -153,25 +159,12 @@ export function createSttService(deps: SttServiceDeps): SttService {
 		}
 	}
 
-	async function ensureModelFiles(): Promise<void> {
-		await mkdir(deps.modelDir, { recursive: true });
-		for (const file of PARAKEET_TDT_FILES) {
-			const path = join(deps.modelDir, file);
-			if (await hasUsableFile(path)) continue;
-			await downloadModelFile(file, path);
-		}
-	}
-
 	async function hasUsableFile(path: string): Promise<boolean> {
 		try {
 			return (await stat(path)).size > 0;
 		} catch {
 			return false;
 		}
-	}
-
-	async function downloadModelFile(file: string, path: string): Promise<void> {
-		return downloadFile(`${PARAKEET_TDT_REPO}/${file}`, file, path);
 	}
 
 	async function downloadFile(url: string, file: string, path: string): Promise<void> {
@@ -238,20 +231,27 @@ export function createSttService(deps: SttServiceDeps): SttService {
 			return;
 		}
 		if (message.type === "speech_start") {
-			emit({ type: "speech_start", index: message.index });
+			emit({ type: "speech_start", userId: message.userId, index: message.index });
 			return;
 		}
 		if (message.type === "speech_end") {
-			emit({ type: "speech_end", index: message.index, duration: message.duration });
+			emit({ type: "speech_end", userId: message.userId, index: message.index, duration: message.duration });
 			return;
 		}
 		if (message.type === "speech_drop") {
-			emit({ type: "speech_drop", index: message.index, duration: message.duration, reason: message.reason });
+			emit({
+				type: "speech_drop",
+				userId: message.userId,
+				index: message.index,
+				duration: message.duration,
+				reason: message.reason,
+			});
 			return;
 		}
 		if (message.type === "interim") {
 			emit({
 				type: "interim",
+				userId: message.userId,
 				index: message.index,
 				text: message.text.trim(),
 				audioMs: message.audioMs,
@@ -261,18 +261,36 @@ export function createSttService(deps: SttServiceDeps): SttService {
 			return;
 		}
 		if (message.type === "final") {
-			emit({ type: "final", index: message.index, text: message.text.trim(), decodeMs: message.decodeMs });
+			emit({
+				type: "final",
+				userId: message.userId,
+				index: message.index,
+				text: message.text.trim(),
+				decodeMs: message.decodeMs,
+			});
 			return;
 		}
-		emit({ type: "error", message: message.message });
+		emit({ type: "error", userId: message.userId, message: message.message });
 	}
 
-	function handleAudioFrame(data: Buffer): void {
+	function writeInputFrame(type: number, userId: string, payload: Buffer = Buffer.alloc(0)): void {
 		if (!childProcess?.stdin || childProcess.stdin.destroyed) return;
-		const header = Buffer.allocUnsafe(4);
-		header.writeUInt32LE(data.byteLength, 0);
+		const userIdBytes = Buffer.from(userId, "utf8");
+		const header = Buffer.allocUnsafe(1 + 4 + userIdBytes.byteLength + 4);
+		header.writeUInt8(type, 0);
+		header.writeUInt32LE(userIdBytes.byteLength, 1);
+		userIdBytes.copy(header, 5);
+		header.writeUInt32LE(payload.byteLength, 5 + userIdBytes.byteLength);
 		childProcess.stdin.write(header);
-		childProcess.stdin.write(data);
+		if (payload.byteLength > 0) childProcess.stdin.write(payload);
+	}
+
+	function handleAudioFrame(userId: string, data: Buffer): void {
+		writeInputFrame(sttInputAudioFrame, userId, data);
+	}
+
+	function closeUser(userId: string): void {
+		writeInputFrame(sttInputCloseUser, userId);
 	}
 
 	function stopChildProcess(): void {
@@ -281,5 +299,5 @@ export function createSttService(deps: SttServiceDeps): SttService {
 
 	workerCommand();
 	startWorker();
-	return { handleAudioFrame, stopChildProcess };
+	return { handleAudioFrame, closeUser, stopChildProcess };
 }

@@ -1,10 +1,25 @@
+* {
+	box-sizing: border-box;
+}
+
 body {
+	min-height: 100vh;
 	font-family: Inter, ui-sans-serif, system-ui, sans-serif;
 	margin: 0;
 	background:
-		radial-gradient(circle at 50% -10%, rgba(68, 224, 255, 0.18), transparent 34rem),
+		radial-gradient(circle at 50% 0%, rgba(68, 224, 255, 0.2), transparent 32rem),
 		linear-gradient(180deg, #111827, #05070b 72%);
 	color: #eef7ff;
+}
+
+#auth {
+	width: min(26rem, calc(100vw - 2rem));
+	min-height: 100vh;
+	margin: 0 auto;
+	padding: 2rem 0;
+	display: grid;
+	align-content: center;
+	justify-items: stretch;
 }
 
 #setup {
@@ -13,11 +28,31 @@ body {
 	padding: clamp(1.5rem, 5vw, 4rem) 0;
 }
 
+#auth[hidden],
+#setup[hidden] {
+	display: none;
+}
+
+#auth h1 {
+	margin: 0;
+	text-align: center;
+	font-size: clamp(4rem, 18vw, 7rem);
+	line-height: 0.82;
+	letter-spacing: -0.09em;
+}
+
 #setup h1 {
 	margin: 0;
 	font-size: clamp(3.5rem, 14vw, 8rem);
 	line-height: 0.9;
 	letter-spacing: -0.08em;
+}
+
+#auth > p {
+	margin: 1rem 0 1.5rem;
+	text-align: center;
+	color: #a9bfd4;
+	font-size: clamp(1rem, 2.5vw, 1.15rem);
 }
 
 #setup p {
@@ -35,6 +70,14 @@ body {
 	background: #0b1320;
 }
 
+#auth .panel {
+	padding: 1.2rem;
+	border-color: rgba(130, 210, 255, 0.24);
+	background: rgba(8, 17, 31, 0.86);
+	box-shadow: 0 1.25rem 4rem rgba(0, 0, 0, 0.3);
+	backdrop-filter: blur(10px);
+}
+
 .controls {
 	display: flex;
 	gap: 0.75rem;
@@ -43,6 +86,7 @@ body {
 }
 
 button,
+input,
 select {
 	font: inherit;
 	font-size: 1rem;
@@ -53,6 +97,7 @@ select {
 	color: #eef7ff;
 }
 
+input,
 select {
 	color-scheme: dark;
 }
@@ -78,6 +123,7 @@ button.primary {
 }
 
 button:hover,
+input:hover,
 select:hover {
 	filter: brightness(1.08);
 }
@@ -85,6 +131,44 @@ select:hover {
 button.primary:disabled {
 	opacity: 0.65;
 	cursor: default;
+}
+
+.auth-panel label {
+	display: grid;
+	align-items: stretch;
+	gap: 0.5rem;
+}
+
+.auth-panel input {
+	width: 100%;
+	background: rgba(255, 255, 255, 0.075);
+}
+
+.auth-panel button.primary {
+	width: 100%;
+	margin-top: 0.25rem;
+}
+
+.error-text {
+	min-height: 1.4em;
+	margin: 0;
+	color: #ff8a8a;
+	font-size: 0.95rem;
+}
+
+.admin-users {
+	margin-top: 1rem;
+}
+
+.admin-users h2 {
+	margin: 0;
+}
+
+.admin-user-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 1rem;
 }
 
 robot-log {

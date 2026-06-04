@@ -6,7 +6,6 @@ import { dirname, join } from "node:path";
 import type { Logger } from "./logger.js";
 
 const workerInputSpeak = 1;
-const workerInputCancel = 2;
 const workerInputShutdown = 3;
 const workerOutputReady = 1;
 const workerOutputAudioStart = 2;
@@ -44,16 +43,30 @@ export interface TtsCallbacks {
 
 export interface TtsService {
 	ready: Promise<void>;
-	start: (callbacks: TtsCallbacks) => void;
-	pushText: (text: string) => void;
-	end: () => void;
+	start: (userId: string, callbacks: TtsCallbacks) => void;
+	pushText: (userId: string, text: string) => void;
+	end: (userId: string) => void;
+	cancelUser: (userId: string, reason: string) => void;
 	cancel: (reason: string) => void;
 	stop: () => void;
 }
 
 interface QueuedRequest {
 	id: number;
+	userId: string;
 	text: string;
+}
+
+interface ActiveRequest extends QueuedRequest {
+	cancelled: boolean;
+}
+
+interface TtsTurn {
+	callbacks: TtsCallbacks;
+	pendingRequests: number;
+	turnEnded: boolean;
+	streamStarted: boolean;
+	cancelled: boolean;
 }
 
 interface DownloadFile {
@@ -227,14 +240,11 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 	const qwen3Logger = logger.tag("qwen3");
 	const textEncoder = new TextEncoder();
 	const queue: QueuedRequest[] = [];
+	const turns = new Map<string, TtsTurn>();
 	let worker: ChildProcess | undefined;
 	let stdoutBuffer = Buffer.alloc(0);
-	let callbacks: TtsCallbacks | undefined;
 	let nextRequestId = 1;
-	let activeRequestId: number | undefined;
-	let turnEnded = false;
-	let cancelled = false;
-	let streamStarted = false;
+	let activeRequest: ActiveRequest | undefined;
 	let resolveReady: (() => void) | undefined;
 	let rejectReady: ((error: Error) => void) | undefined;
 
@@ -248,27 +258,36 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 		worker.stdin.write(makeFrame(type, id, payload));
 	}
 
-	function finishIfIdle(): void {
-		if (!callbacks || activeRequestId !== undefined || queue.length > 0 || !turnEnded) return;
-		const done = callbacks.onDone;
-		callbacks = undefined;
-		done();
+	function userHasQueuedRequest(userId: string): boolean {
+		return queue.some((request) => request.userId === userId) || activeRequest?.userId === userId;
+	}
+
+	function finishTurnIfIdle(userId: string): void {
+		const turn = turns.get(userId);
+		if (!turn || !turn.turnEnded || turn.pendingRequests > 0 || userHasQueuedRequest(userId)) return;
+		turns.delete(userId);
+		turn.callbacks.onDone();
+	}
+
+	function failTurn(userId: string, message: string): void {
+		const turn = turns.get(userId);
+		if (!turn) return;
+		turns.delete(userId);
+		turn.callbacks.onError(message);
 	}
 
 	function pump(): void {
-		if (!callbacks || activeRequestId !== undefined) return;
+		if (activeRequest) return;
 		const request = queue.shift();
-		if (!request) {
-			finishIfIdle();
-			return;
-		}
-		activeRequestId = request.id;
+		if (!request) return;
+		activeRequest = { ...request, cancelled: false };
 		try {
 			sendFrame(workerInputSpeak, request.id, textEncoder.encode(request.text));
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			callbacks.onError(message);
-			callbacks = undefined;
+			activeRequest = undefined;
+			failTurn(request.userId, message);
+			pump();
 		}
 	}
 
@@ -279,28 +298,47 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 			resolveReady = undefined;
 			return;
 		}
-		if (!callbacks || id !== activeRequestId || cancelled) return;
+		const request = activeRequest;
+		if (!request || id !== request.id) return;
+		const turn = turns.get(request.userId);
+		if (request.cancelled) {
+			if (type === workerOutputAudioDone || type === workerOutputError) {
+				activeRequest = undefined;
+				pump();
+			}
+			return;
+		}
+		if (!turn || turn.cancelled) {
+			if (type === workerOutputAudioDone || type === workerOutputError) {
+				if (turn) turns.delete(request.userId);
+				activeRequest = undefined;
+				pump();
+			}
+			return;
+		}
 		if (type === workerOutputAudioStart) {
-			if (!streamStarted) {
-				streamStarted = true;
+			if (!turn.streamStarted) {
+				turn.streamStarted = true;
 				const sampleRate = payload.byteLength >= 4 ? Buffer.from(payload).readUInt32LE(0) : qwen3OutputSampleRate;
-				callbacks.onStart(sampleRate);
+				turn.callbacks.onStart(sampleRate);
 			}
 			return;
 		}
 		if (type === workerOutputAudioChunk) {
-			callbacks.onAudio(payload);
+			turn.callbacks.onAudio(payload);
 			return;
 		}
 		if (type === workerOutputAudioDone) {
-			activeRequestId = undefined;
+			turn.pendingRequests = Math.max(0, turn.pendingRequests - 1);
+			activeRequest = undefined;
+			finishTurnIfIdle(request.userId);
 			pump();
 			return;
 		}
 		if (type === workerOutputError) {
-			activeRequestId = undefined;
-			callbacks.onError(decodeUtf8(payload));
-			callbacks = undefined;
+			activeRequest = undefined;
+			failTurn(request.userId, decodeUtf8(payload));
+			pump();
 		}
 	}
 
@@ -377,15 +415,13 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 		});
 		child.once("error", (error) => {
 			rejectReady?.(error);
-			callbacks?.onError(error.message);
-			callbacks = undefined;
+			for (const userId of turns.keys()) failTurn(userId, error.message);
 		});
 		child.once("exit", (code, signal) => {
 			if (worker === child) worker = undefined;
 			const error = new Error(`Qwen3 TTS worker exited code=${code ?? "none"} signal=${signal ?? "none"}`);
 			rejectReady?.(error);
-			callbacks?.onError(error.message);
-			callbacks = undefined;
+			for (const userId of turns.keys()) failTurn(userId, error.message);
 			if (code !== 0) logger.log(error.message);
 		});
 	}
@@ -395,47 +431,59 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 			const normalized = error instanceof Error ? error : new Error(String(error));
 			logger.log(normalized.message);
 			rejectReady?.(normalized);
-			callbacks?.onError(normalized.message);
-			callbacks = undefined;
+			for (const userId of turns.keys()) failTurn(userId, normalized.message);
 		});
 	}
 
-	function start(nextCallbacks: TtsCallbacks): void {
-		if (callbacks) cancel("new TTS stream");
-		callbacks = nextCallbacks;
-		queue.length = 0;
-		activeRequestId = undefined;
-		turnEnded = false;
-		cancelled = false;
-		streamStarted = false;
+	function start(userId: string, nextCallbacks: TtsCallbacks): void {
+		cancelUser(userId, "new TTS stream");
+		turns.set(userId, {
+			callbacks: nextCallbacks,
+			pendingRequests: 0,
+			turnEnded: false,
+			streamStarted: false,
+			cancelled: false,
+		});
 	}
 
-	function pushText(text: string): void {
+	function pushText(userId: string, text: string): void {
+		const turn = turns.get(userId);
 		const trimmed = text.trim();
-		if (!callbacks || !trimmed) return;
-		queue.push({ id: nextRequestId++, text: trimmed });
+		if (!turn || !trimmed) return;
+		const request = { id: nextRequestId++, userId, text: trimmed };
+		turn.pendingRequests++;
+		queue.push(request);
 		pump();
 	}
 
-	function end(): void {
-		turnEnded = true;
-		if (!streamStarted && activeRequestId === undefined && queue.length === 0)
-			callbacks?.onStart(qwen3OutputSampleRate);
-		finishIfIdle();
+	function end(userId: string): void {
+		const turn = turns.get(userId);
+		if (!turn) return;
+		turn.turnEnded = true;
+		if (!turn.streamStarted && !userHasQueuedRequest(userId)) turn.callbacks.onStart(qwen3OutputSampleRate);
+		finishTurnIfIdle(userId);
+	}
+
+	function cancelUser(userId: string, reason: string): void {
+		qwen3Logger.log(`cancel ${userId}: ${reason}`);
+		const turn = turns.get(userId);
+		if (turn) turn.cancelled = true;
+		let removed = 0;
+		for (let i = queue.length - 1; i >= 0; i--) {
+			const request = queue[i];
+			if (request?.userId !== userId) continue;
+			queue.splice(i, 1);
+			removed++;
+		}
+		if (turn) turn.pendingRequests = Math.max(0, turn.pendingRequests - removed);
+		if (activeRequest?.userId === userId) activeRequest.cancelled = true;
+		turns.delete(userId);
 	}
 
 	function cancel(reason: string): void {
-		qwen3Logger.log(`cancel: ${reason}`);
-		cancelled = true;
-		try {
-			for (const request of queue) sendFrame(workerInputCancel, request.id);
-			if (activeRequestId !== undefined) sendFrame(workerInputCancel, activeRequestId);
-		} catch {
-			// process may already be gone
-		}
+		qwen3Logger.log(`cancel all: ${reason}`);
+		for (const userId of [...turns.keys()]) cancelUser(userId, reason);
 		queue.length = 0;
-		activeRequestId = undefined;
-		callbacks = undefined;
 	}
 
 	function stop(): void {
@@ -449,5 +497,5 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 
 	startWorker();
 
-	return { ready, start, pushText, end, cancel, stop };
+	return { ready, start, pushText, end, cancelUser, cancel, stop };
 }

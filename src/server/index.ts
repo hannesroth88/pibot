@@ -1,7 +1,8 @@
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { RobotState, ServerMessage } from "../types.js";
+import { type AuthenticatedUser, UserAuthService } from "./auth.js";
 import { serverConfig } from "./config.js";
-import { createRobotHarness, type RobotHarnessEvent } from "./harness.js";
+import { createRobotHarness, type RobotHarness, type RobotHarnessEvent } from "./harness.js";
 import { createHttpServer } from "./http-server.js";
 import { createLlamaService, localLlmConfigs } from "./llama.js";
 import { createLogger, formatEntry } from "./logger.js";
@@ -13,30 +14,48 @@ import { createSttService, type SttEvent } from "./stt.js";
 import { createTtsService } from "./tts.js";
 import { attachWebSockets as createWebSocketServer, type WebsocketEvent } from "./websocket-server.js";
 
-let broadcast: (message: ServerMessage) => void = () => undefined;
-let robotState: RobotState = { phase: "inactive" };
-let speechActive = false;
-let lastSpeechEndedAt = 0;
-let stoppedUtteranceIndex: number | undefined;
-let activeChunker: SentenceChunker | undefined;
-let activeAssistantText = "";
-let ttsStartedForTurn = false;
-let speechPlaybackFinished: Promise<void> | undefined;
-let resolveSpeechPlaybackFinished: (() => void) | undefined;
-let bargeInActive = false;
-let activeToolState: { name: string; args: unknown } | undefined;
+interface UserRuntime {
+	user: AuthenticatedUser;
+	userId: string;
+	connected: boolean;
+	robot: RobotClient;
+	harness: RobotHarness;
+	state: RobotState;
+	speechActive: boolean;
+	lastSpeechEndedAt: number;
+	stoppedUtteranceIndex: number | undefined;
+	activeChunker: SentenceChunker | undefined;
+	activeAssistantText: string;
+	ttsStartedForTurn: boolean;
+	speechPlaybackFinished: Promise<void> | undefined;
+	resolveSpeechPlaybackFinished: (() => void) | undefined;
+	bargeInActive: boolean;
+	activeToolState: { name: string; args: unknown } | undefined;
+}
+
+let sendToUser: (userId: string, message: ServerMessage) => void = () => undefined;
+let sttReady = false;
 
 const logger = createLogger((entry) => {
 	console.log(formatEntry(entry, true));
-	broadcast({ type: "log", entry });
+	const userTag = entry.tags.find((tag) => tag.startsWith("user:"));
+	const userId = userTag?.slice("user:".length) ?? /^\[([a-z0-9_-]{1,32})] /.exec(entry.message)?.[1];
+	if (userId) sendToUser(userId, { type: "log", entry });
 });
 const serverLogger = logger.tag("server");
 const agentLogger = logger.tag("agent");
 const sttLogger = logger.tag("stt");
 const ttsLogger = logger.tag("tts");
 const executionEnv = new NodeExecutionEnv({ cwd: process.cwd() });
-const memoryStore = createFileMemoryStore(executionEnv, { path: serverConfig.memoryFile });
-const robot = new RobotClient();
+const auth = new UserAuthService({
+	usersFile: serverConfig.usersFile,
+	sessionsFile: serverConfig.sessionsFile,
+	userMemoryDir: serverConfig.userMemoryDir,
+	adminUser: serverConfig.adminUser,
+	adminPassword: serverConfig.adminPassword,
+	secureCookies: serverConfig.secureCookies,
+});
+const userRuntimes = new Map<string, UserRuntime>();
 const localLlmConfig = localLlmConfigs[serverConfig.localLlm];
 const llama = await createLlamaService({
 	cacheDir: serverConfig.pibotCacheDir,
@@ -61,51 +80,89 @@ const tts = createTtsService({
 	logger,
 });
 const stt = createSttService({
-	workerKind: serverConfig.sttWorker,
-	workerBinaryPath: serverConfig.sttWorkerBinaryPath,
-	modelDir: serverConfig.parakeetTdtModelDir,
 	parakeetCppWorkerPath: serverConfig.parakeetCppWorkerPath,
 	parakeetCppModelPath: serverConfig.parakeetCppModelPath,
 	sileroVadGgmlModelPath: serverConfig.sileroVadGgmlModelPath,
 	logger,
 	onEvent: handleSttEvent,
 });
-const harness = await createRobotHarness({
-	env: executionEnv,
-	logger,
-	memoryStore,
-	localLlm: serverConfig.localLlm,
-	localBaseUrl: serverConfig.llamaBaseUrl,
-	localContextWindow: serverConfig.llamaContextWindow,
-	maxContextImages: serverConfig.maxContextImages,
-	robot,
-	onEvent: handleHarnessEvent,
-	beforeTool: waitForSpeechBeforeTool,
-});
 const http = createHttpServer({
 	publicDir: serverConfig.publicDir,
 	version: serverConfig.version,
+	auth,
 });
 const websockets = createWebSocketServer({
 	server: http.server,
 	logger,
+	authenticate: (req) => auth.authenticateRequest(req),
 	onEvent: handleWebsocketEvent,
 });
-broadcast = websockets.broadcast;
-logSelectedModel();
+sendToUser = websockets.send;
 
-function logSelectedModel(): void {
-	const model = harness.model();
-	agentLogger.log(`using model ${model.provider}/${model.id} (${model.name}) context=${model.contextWindow}`);
+function createRuntimeBase(user: AuthenticatedUser, harness: RobotHarness, robot: RobotClient): UserRuntime {
+	return {
+		user,
+		userId: user.name,
+		connected: false,
+		robot,
+		harness,
+		state: sttReady ? { phase: "listening" } : { phase: "inactive" },
+		speechActive: false,
+		lastSpeechEndedAt: 0,
+		stoppedUtteranceIndex: undefined,
+		activeChunker: undefined,
+		activeAssistantText: "",
+		ttsStartedForTurn: false,
+		speechPlaybackFinished: undefined,
+		resolveSpeechPlaybackFinished: undefined,
+		bargeInActive: false,
+		activeToolState: undefined,
+	};
 }
 
-function setRobotState(state: RobotState): void {
-	robotState = state;
-	broadcast({ type: "state", state });
+async function getUserRuntime(user: AuthenticatedUser): Promise<UserRuntime> {
+	const existing = userRuntimes.get(user.name);
+	if (existing) return existing;
+	const robot = new RobotClient();
+	const memoryStore = createFileMemoryStore(executionEnv, { path: user.memoryFile });
+	let runtime: UserRuntime | undefined;
+	const harness = await createRobotHarness({
+		env: executionEnv,
+		logger,
+		memoryStore,
+		localLlm: serverConfig.localLlm,
+		localBaseUrl: serverConfig.llamaBaseUrl,
+		localContextWindow: serverConfig.llamaContextWindow,
+		maxContextImages: serverConfig.maxContextImages,
+		robot,
+		onEvent: async (event) => {
+			if (!runtime?.connected) return;
+			await handleHarnessEvent(runtime, event);
+		},
+		beforeTool: async (name) => {
+			if (!runtime?.connected) throw new Error(`tool ${name} blocked because user is not connected`);
+			await waitForSpeechBeforeTool(runtime, name);
+		},
+	});
+	runtime = createRuntimeBase(user, harness, robot);
+	userRuntimes.set(user.name, runtime);
+	return runtime;
 }
 
-function assistantText(): string {
-	return "assistantText" in robotState ? robotState.assistantText : "";
+function logSelectedModel(runtime: UserRuntime): void {
+	const model = runtime.harness.model();
+	agentLogger.log(
+		`[${runtime.userId}] using model ${model.provider}/${model.id} (${model.name}) context=${model.contextWindow}`,
+	);
+}
+
+function setRobotState(runtime: UserRuntime, state: RobotState): void {
+	runtime.state = state;
+	sendToUser(runtime.userId, { type: "state", state });
+}
+
+function assistantText(runtime: UserRuntime): string {
+	return "assistantText" in runtime.state ? runtime.state.assistantText : "";
 }
 
 function looksLikeStopCommand(text: string): boolean {
@@ -137,151 +194,167 @@ function looksLikeStopCommand(text: string): boolean {
 	return false;
 }
 
-function submitPrompt(text: string): void {
-	setRobotState({ phase: "thinking", heardText: text, assistantText: "" });
-	void harness
+function submitPrompt(runtime: UserRuntime, text: string): void {
+	setRobotState(runtime, { phase: "thinking", heardText: text, assistantText: "" });
+	void runtime.harness
 		.current()
 		.prompt(text)
 		.catch((error) => {
 			const message = error instanceof Error ? error.message : String(error);
 			if (message.includes("busy")) {
-				sttLogger.log(`ignored final while agent busy: ${JSON.stringify(text)}`);
-				setRobotState({ phase: "listening" });
+				sttLogger.log(`[${runtime.userId}] ignored final while agent busy: ${JSON.stringify(text)}`);
+				setRobotState(runtime, { phase: "listening" });
 				return;
 			}
-			sttLogger.log(`prompt failed: ${message}`);
-			setRobotState({ phase: "error", message });
+			sttLogger.log(`[${runtime.userId}] prompt failed: ${message}`);
+			setRobotState(runtime, { phase: "error", message });
 		});
 }
 
 function handleSttEvent(event: SttEvent): void {
 	if (event.type === "ready") {
+		sttReady = true;
 		sttLogger.log(
 			`Parakeet ready sampleRate=${event.sampleRate} vadChunkMs=${event.vadChunkMs} threshold=${event.vadThreshold} energyGate=${event.energyGate ?? "off"} minSilenceMs=${event.minSilenceMs} prerollMs=${event.prerollMs} interimIntervalMs=${event.interimIntervalMs ?? "off"} interimMinAudioMs=${event.interimMinAudioMs ?? "off"} interimWindowMs=${event.interimWindowMs ?? "off"}`,
 		);
-		setRobotState({ phase: "listening" });
+		for (const runtime of userRuntimes.values()) {
+			if (runtime.connected && runtime.state.phase === "inactive") setRobotState(runtime, { phase: "listening" });
+		}
+		return;
+	}
+	const runtime = event.userId ? userRuntimes.get(event.userId) : undefined;
+	if (!runtime?.connected) {
+		if (event.type === "error") sttLogger.log(`error without active user: ${event.message}`);
+		return;
 	}
 	if (event.type === "speech_start") {
-		stoppedUtteranceIndex = undefined;
-		sttLogger.log(`speech_start #${event.index}`);
-		setRobotState({ phase: "hearing" });
+		runtime.stoppedUtteranceIndex = undefined;
+		sttLogger.log(`[${runtime.userId}] speech_start #${event.index}`);
+		setRobotState(runtime, { phase: "hearing" });
 	}
 	if (event.type === "speech_end") {
-		sttLogger.log(`speech_end #${event.index} duration=${event.duration.toFixed(2)}s`);
+		sttLogger.log(`[${runtime.userId}] speech_end #${event.index} duration=${event.duration.toFixed(2)}s`);
 	}
 	if (event.type === "speech_drop") {
-		sttLogger.log(`speech_drop #${event.index} reason=${event.reason} duration=${event.duration.toFixed(2)}s`);
-		setRobotState({ phase: "listening" });
+		sttLogger.log(
+			`[${runtime.userId}] speech_drop #${event.index} reason=${event.reason} duration=${event.duration.toFixed(2)}s`,
+		);
+		setRobotState(runtime, { phase: "listening" });
 	}
 	if (event.type === "interim") {
 		sttLogger.log(
-			`interim #${event.index} audioMs=${event.audioMs} windowMs=${event.windowMs ?? "full"} decodeMs=${event.decodeMs} text=${JSON.stringify(event.text)}`,
+			`[${runtime.userId}] interim #${event.index} audioMs=${event.audioMs} windowMs=${event.windowMs ?? "full"} decodeMs=${event.decodeMs} text=${JSON.stringify(event.text)}`,
 		);
 		if (
-			(speechActive || bargeInActive) &&
+			(runtime.speechActive || runtime.bargeInActive) &&
 			event.text &&
 			looksLikeStopCommand(event.text) &&
-			stoppedUtteranceIndex !== event.index
+			runtime.stoppedUtteranceIndex !== event.index
 		) {
-			stoppedUtteranceIndex = event.index;
-			sttLogger.log("stop-word detected in interim");
-			void abortRobotTurn(`interim stop word: ${event.text}`);
+			runtime.stoppedUtteranceIndex = event.index;
+			sttLogger.log(`[${runtime.userId}] stop-word detected in interim`);
+			void abortRobotTurn(runtime, `interim stop word: ${event.text}`);
 		}
 	}
-	if (event.type === "error") setRobotState({ phase: "error", message: event.message });
+	if (event.type === "error") setRobotState(runtime, { phase: "error", message: event.message });
 	if (event.type === "final") {
-		sttLogger.log(`final #${event.index} decodeMs=${event.decodeMs} text=${JSON.stringify(event.text)}`);
-		if (stoppedUtteranceIndex === event.index) {
-			stoppedUtteranceIndex = undefined;
-			bargeInActive = false;
-			setRobotState({ phase: "listening" });
+		sttLogger.log(
+			`[${runtime.userId}] final #${event.index} decodeMs=${event.decodeMs} text=${JSON.stringify(event.text)}`,
+		);
+		if (runtime.stoppedUtteranceIndex === event.index) {
+			runtime.stoppedUtteranceIndex = undefined;
+			runtime.bargeInActive = false;
+			setRobotState(runtime, { phase: "listening" });
 			return;
 		}
-		if (event.text && looksLikeStopCommand(event.text) && (speechActive || bargeInActive)) {
-			stoppedUtteranceIndex = event.index;
-			sttLogger.log("stop-word detected in final");
-			bargeInActive = false;
-			void abortRobotTurn(`final stop word: ${event.text}`);
+		if (event.text && looksLikeStopCommand(event.text) && (runtime.speechActive || runtime.bargeInActive)) {
+			runtime.stoppedUtteranceIndex = event.index;
+			sttLogger.log(`[${runtime.userId}] stop-word detected in final`);
+			runtime.bargeInActive = false;
+			void abortRobotTurn(runtime, `final stop word: ${event.text}`);
 			return;
 		}
 		if (!event.text) {
-			bargeInActive = false;
-			setRobotState({ phase: "listening" });
+			runtime.bargeInActive = false;
+			setRobotState(runtime, { phase: "listening" });
 			return;
 		}
-		if (bargeInActive) {
-			bargeInActive = false;
-			if (robotState.phase === "tool" || activeToolState) {
-				sttLogger.log(`ignored barge-in final while tool is active: ${JSON.stringify(event.text)}`);
-				if (activeToolState) {
-					setRobotState({
+		if (runtime.bargeInActive) {
+			runtime.bargeInActive = false;
+			if (runtime.state.phase === "tool" || runtime.activeToolState) {
+				sttLogger.log(
+					`[${runtime.userId}] ignored barge-in final while tool is active: ${JSON.stringify(event.text)}`,
+				);
+				if (runtime.activeToolState) {
+					setRobotState(runtime, {
 						phase: "tool",
-						name: activeToolState.name,
-						args: activeToolState.args,
-						assistantText: assistantText(),
+						name: runtime.activeToolState.name,
+						args: runtime.activeToolState.args,
+						assistantText: assistantText(runtime),
 					});
-				} else setRobotState({ phase: "listening" });
+				} else setRobotState(runtime, { phase: "listening" });
 				return;
 			}
-			submitPrompt(event.text);
+			submitPrompt(runtime, event.text);
 			return;
 		}
-		if (speechActive || Date.now() - lastSpeechEndedAt < 1500) {
-			setRobotState({ phase: "listening" });
+		if (runtime.speechActive || Date.now() - runtime.lastSpeechEndedAt < 1500) {
+			setRobotState(runtime, { phase: "listening" });
 			return;
 		}
-		submitPrompt(event.text);
+		submitPrompt(runtime, event.text);
 	}
 }
 
-function startAssistantSpeechStream(): void {
-	speechPlaybackFinished = new Promise((resolve) => {
-		resolveSpeechPlaybackFinished = resolve;
+function startAssistantSpeechStream(runtime: UserRuntime): void {
+	runtime.speechPlaybackFinished = new Promise((resolve) => {
+		runtime.resolveSpeechPlaybackFinished = resolve;
 	});
-	speechActive = true;
-	ttsStartedForTurn = true;
-	setRobotState({ phase: "speaking", assistantText: activeAssistantText });
-	tts.start({
+	runtime.speechActive = true;
+	runtime.ttsStartedForTurn = true;
+	setRobotState(runtime, { phase: "speaking", assistantText: runtime.activeAssistantText });
+	tts.start(runtime.userId, {
 		onStart: (sampleRate) => {
-			ttsLogger.log(`PCM stream start sampleRate=${sampleRate}`);
-			if (!robot.sendTtsStart(sampleRate)) ttsLogger.log("no browser client for TTS start");
+			ttsLogger.log(`[${runtime.userId}] PCM stream start sampleRate=${sampleRate}`);
+			if (!runtime.robot.sendTtsStart(sampleRate))
+				ttsLogger.log(`[${runtime.userId}] no browser client for TTS start`);
 		},
 		onAudio: (pcm) => {
-			if (!robot.sendTtsAudio(pcm)) ttsLogger.log("no browser client for TTS audio");
+			if (!runtime.robot.sendTtsAudio(pcm)) ttsLogger.log(`[${runtime.userId}] no browser client for TTS audio`);
 		},
 		onDone: () => {
-			ttsLogger.log("PCM synthesis done");
-			if (!robot.sendTtsDone()) finishSpeechPlayback("no browser client");
+			ttsLogger.log(`[${runtime.userId}] PCM synthesis done`);
+			if (!runtime.robot.sendTtsDone()) finishSpeechPlayback(runtime, "no browser client");
 		},
 		onError: (message) => {
-			ttsLogger.log(`PCM synthesis error: ${message}`);
-			robot.sendTtsError(message);
-			finishSpeechPlayback(`TTS error: ${message}`);
+			ttsLogger.log(`[${runtime.userId}] PCM synthesis error: ${message}`);
+			runtime.robot.sendTtsError(message);
+			finishSpeechPlayback(runtime, `TTS error: ${message}`);
 		},
 	});
 }
 
-function finishSpeechPlayback(reason: string, setListening = true): void {
-	if (!speechActive && !ttsStartedForTurn) return;
-	speechActive = false;
-	ttsStartedForTurn = false;
-	activeChunker = undefined;
-	resolveSpeechPlaybackFinished?.();
-	resolveSpeechPlaybackFinished = undefined;
-	speechPlaybackFinished = undefined;
-	ttsLogger.log(`speech finished: ${reason}`);
+function finishSpeechPlayback(runtime: UserRuntime, reason: string, setListening = true): void {
+	if (!runtime.speechActive && !runtime.ttsStartedForTurn) return;
+	runtime.speechActive = false;
+	runtime.ttsStartedForTurn = false;
+	runtime.activeChunker = undefined;
+	runtime.resolveSpeechPlaybackFinished?.();
+	runtime.resolveSpeechPlaybackFinished = undefined;
+	runtime.speechPlaybackFinished = undefined;
+	ttsLogger.log(`[${runtime.userId}] speech finished: ${reason}`);
 	if (!setListening) return;
-	lastSpeechEndedAt = Date.now();
-	setRobotState({ phase: "listening" });
+	runtime.lastSpeechEndedAt = Date.now();
+	setRobotState(runtime, { phase: "listening" });
 }
 
-async function waitForSpeechBeforeTool(name: string): Promise<void> {
-	const pendingSpeech = speechPlaybackFinished;
+async function waitForSpeechBeforeTool(runtime: UserRuntime, name: string): Promise<void> {
+	const pendingSpeech = runtime.speechPlaybackFinished;
 	if (pendingSpeech) {
-		ttsLogger.log(`waiting for speech before tool ${name}`);
+		ttsLogger.log(`[${runtime.userId}] waiting for speech before tool ${name}`);
 		await pendingSpeech;
 	}
-	if (bargeInActive) throw new Error(`tool ${name} blocked by barge-in`);
+	if (runtime.bargeInActive) throw new Error(`tool ${name} blocked by barge-in`);
 }
 
 function sanitizeTextForTts(text: string): string {
@@ -292,151 +365,174 @@ function logToolResult(name: string, result: unknown): void {
 	if (name === "spotify_search") agentLogger.log(`spotify_search result ${JSON.stringify(result)}`);
 }
 
-function handleAssistantTextDelta(text: string): void {
-	activeAssistantText += text;
-	setRobotState({ phase: ttsStartedForTurn ? "speaking" : "thinking", assistantText: activeAssistantText });
-	const chunker = activeChunker;
+function handleAssistantTextDelta(runtime: UserRuntime, text: string): void {
+	runtime.activeAssistantText += text;
+	setRobotState(runtime, {
+		phase: runtime.ttsStartedForTurn ? "speaking" : "thinking",
+		assistantText: runtime.activeAssistantText,
+	});
+	const chunker = runtime.activeChunker;
 	if (!chunker) return;
 	for (const chunk of chunker.push(sanitizeTextForTts(text))) {
-		if (!ttsStartedForTurn) startAssistantSpeechStream();
-		ttsLogger.log(`queue text chunk chars=${chunk.length}`);
-		tts.pushText(chunk);
+		if (!runtime.ttsStartedForTurn) startAssistantSpeechStream(runtime);
+		ttsLogger.log(`[${runtime.userId}] queue text chunk chars=${chunk.length}`);
+		tts.pushText(runtime.userId, chunk);
 	}
 }
 
-async function handleHarnessEvent(event: RobotHarnessEvent): Promise<void> {
-	if (bargeInActive) {
+async function handleHarnessEvent(runtime: UserRuntime, event: RobotHarnessEvent): Promise<void> {
+	if (runtime.bargeInActive) {
 		if (event.type === "tool_end") {
-			activeToolState = undefined;
-			agentLogger.log(`tool ${event.name} finished${event.isError ? " with error" : ""}`);
+			runtime.activeToolState = undefined;
+			agentLogger.log(`[${runtime.userId}] tool ${event.name} finished${event.isError ? " with error" : ""}`);
 			logToolResult(event.name, event.result);
 		}
-		if (event.type !== "tool_end") agentLogger.log(`ignored stale ${event.type} during barge-in`);
+		if (event.type !== "tool_end") agentLogger.log(`[${runtime.userId}] ignored stale ${event.type} during barge-in`);
 		return;
 	}
 	if (event.type === "assistant_start") {
-		activeAssistantText = "";
-		activeChunker = createSentenceChunker({ sentencesPerChunk: 1 });
-		ttsStartedForTurn = false;
-		setRobotState({ phase: "thinking", assistantText: "" });
+		runtime.activeAssistantText = "";
+		runtime.activeChunker = createSentenceChunker({ sentencesPerChunk: 1 });
+		runtime.ttsStartedForTurn = false;
+		setRobotState(runtime, { phase: "thinking", assistantText: "" });
 	}
-	if (event.type === "assistant_delta") handleAssistantTextDelta(event.text);
+	if (event.type === "assistant_delta") handleAssistantTextDelta(runtime, event.text);
 	if (event.type === "tool_start") {
-		activeToolState = { name: event.name, args: event.args };
-		setRobotState({ phase: "tool", name: event.name, args: event.args, assistantText: assistantText() });
-		agentLogger.log(`tool ${event.name} ${JSON.stringify(event.args)}`);
+		runtime.activeToolState = { name: event.name, args: event.args };
+		setRobotState(runtime, {
+			phase: "tool",
+			name: event.name,
+			args: event.args,
+			assistantText: assistantText(runtime),
+		});
+		agentLogger.log(`[${runtime.userId}] tool ${event.name} ${JSON.stringify(event.args)}`);
 	}
 	if (event.type === "tool_end") {
-		activeToolState = undefined;
-		agentLogger.log(`tool ${event.name} finished${event.isError ? " with error" : ""}`);
+		runtime.activeToolState = undefined;
+		agentLogger.log(`[${runtime.userId}] tool ${event.name} finished${event.isError ? " with error" : ""}`);
 		logToolResult(event.name, event.result);
 	}
 	if (event.type === "assistant_end") {
-		if (event.text) agentLogger.log(`LLM: ${event.text}`);
-		else agentLogger.log("LLM: <empty assistant response>");
-		if (!activeAssistantText && event.text) handleAssistantTextDelta(event.text);
-		const tail = activeChunker?.flush();
+		if (event.text) agentLogger.log(`[${runtime.userId}] LLM: ${event.text}`);
+		else agentLogger.log(`[${runtime.userId}] LLM: <empty assistant response>`);
+		if (!runtime.activeAssistantText && event.text) handleAssistantTextDelta(runtime, event.text);
+		const tail = runtime.activeChunker?.flush();
 		if (tail) {
-			if (!ttsStartedForTurn) startAssistantSpeechStream();
-			ttsLogger.log(`queue final text chunk chars=${tail.length}`);
-			tts.pushText(tail);
+			if (!runtime.ttsStartedForTurn) startAssistantSpeechStream(runtime);
+			ttsLogger.log(`[${runtime.userId}] queue final text chunk chars=${tail.length}`);
+			tts.pushText(runtime.userId, tail);
 		}
-		if (ttsStartedForTurn) tts.end();
-		else setRobotState({ phase: "listening" });
+		if (runtime.ttsStartedForTurn) tts.end(runtime.userId);
+		else setRobotState(runtime, { phase: "listening" });
 	}
 	if (event.type === "session_reset") {
-		setRobotState({ phase: "inactive" });
-		agentLogger.log("session reset; context cleared");
+		setRobotState(runtime, sttReady ? { phase: "listening" } : { phase: "inactive" });
+		agentLogger.log(`[${runtime.userId}] session reset; context cleared`);
 	}
 }
 
-async function abortRobotTurn(reason: string): Promise<void> {
-	bargeInActive = false;
-	activeToolState = undefined;
-	agentLogger.log(`abort: ${reason}`);
-	void robot.execute({ type: "cancel_speech", payload: { reason }, timeoutMs: 1000 }).catch(() => undefined);
-	tts.cancel(reason);
-	robot.sendTtsDone();
-	finishSpeechPlayback(`aborted: ${reason}`);
+async function abortRobotTurn(runtime: UserRuntime, reason: string): Promise<void> {
+	runtime.bargeInActive = false;
+	runtime.activeToolState = undefined;
+	agentLogger.log(`[${runtime.userId}] abort: ${reason}`);
+	void runtime.robot.execute({ type: "cancel_speech", payload: { reason }, timeoutMs: 1000 }).catch(() => undefined);
+	tts.cancelUser(runtime.userId, reason);
+	runtime.robot.sendTtsDone();
+	finishSpeechPlayback(runtime, `aborted: ${reason}`);
 	try {
-		await harness.current().abort();
+		await runtime.harness.current().abort();
 	} catch (error) {
-		agentLogger.log(`harness abort error: ${error instanceof Error ? error.message : String(error)}`);
+		agentLogger.log(
+			`[${runtime.userId}] harness abort error: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
-	setRobotState({ phase: "listening" });
+	setRobotState(runtime, { phase: "listening" });
 }
 
-async function handleBargeIn(): Promise<void> {
-	const interruptedPhase = robotState.phase;
-	bargeInActive = true;
-	lastSpeechEndedAt = 0;
-	stoppedUtteranceIndex = undefined;
-	sttLogger.log(`barge-in detected by client during ${interruptedPhase}`);
-	setRobotState({ phase: "hearing" });
+async function handleBargeIn(runtime: UserRuntime): Promise<void> {
+	const interruptedPhase = runtime.state.phase;
+	runtime.bargeInActive = true;
+	runtime.lastSpeechEndedAt = 0;
+	runtime.stoppedUtteranceIndex = undefined;
+	sttLogger.log(`[${runtime.userId}] barge-in detected by client during ${interruptedPhase}`);
+	setRobotState(runtime, { phase: "hearing" });
 	if (interruptedPhase !== "speaking" && interruptedPhase !== "thinking") return;
-	tts.cancel("barge-in");
-	robot.sendTtsDone();
-	finishSpeechPlayback("barge-in", false);
+	tts.cancelUser(runtime.userId, "barge-in");
+	runtime.robot.sendTtsDone();
+	finishSpeechPlayback(runtime, "barge-in", false);
 	try {
-		await harness.current().abort();
+		await runtime.harness.current().abort();
 	} catch (error) {
-		agentLogger.log(`harness abort error: ${error instanceof Error ? error.message : String(error)}`);
+		agentLogger.log(
+			`[${runtime.userId}] harness abort error: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
-	if (bargeInActive) setRobotState({ phase: "hearing" });
+	if (runtime.bargeInActive) setRobotState(runtime, { phase: "hearing" });
 }
 
 async function handleWebsocketEvent(event: WebsocketEvent): Promise<void> {
 	if (event.type === "client_connected") {
-		serverLogger.log("browser client connected");
-		logSelectedModel();
-		event.client.send(JSON.stringify({ type: "state", state: robotState }));
-		robot.setWebSocket(event.client);
-		logger.tag("robot").log("active robot client connected");
+		const runtime = await getUserRuntime(event.user);
+		runtime.connected = true;
+		runtime.robot.setWebSocket(event.client);
+		serverLogger.log(`browser client connected as ${event.userId}`);
+		if (runtime.state.phase === "inactive" && sttReady) setRobotState(runtime, { phase: "listening" });
+		logSelectedModel(runtime);
+		event.client.send(JSON.stringify({ type: "state", state: runtime.state }));
+		logger.tag("robot").log(`[${event.userId}] active robot client connected`);
+		return;
 	}
+	const runtime = userRuntimes.get(event.userId);
+	if (!runtime) return;
 	if (event.type === "client_disconnected") {
-		serverLogger.log("browser client disconnected");
-		tts.cancel("browser client disconnected");
-		finishSpeechPlayback("browser client disconnected");
+		serverLogger.log(`browser client disconnected (${event.userId})`);
+		runtime.connected = false;
+		stt.closeUser(event.userId);
+		tts.cancelUser(event.userId, "browser client disconnected");
+		finishSpeechPlayback(runtime, "browser client disconnected");
+		runtime.robot.rejectAll("Robot client disconnected");
+		return;
 	}
 	if (event.type === "client_message") {
 		const msg = event.message;
 		if (msg.type === "client_log") {
-			logger.logRaw("client", msg.tags, msg.message, msg.time);
+			logger.logRaw("client", [...msg.tags, `user:${event.userId}`], msg.message, msg.time);
 			return;
 		}
-		if (robot.handleMessage(msg)) return;
+		if (runtime.robot.handleMessage(msg)) return;
 		if (msg.type === "tts_playback_done") {
-			if (bargeInActive) {
-				ttsLogger.log("ignored late playback done after barge-in");
+			if (runtime.bargeInActive) {
+				ttsLogger.log(`[${runtime.userId}] ignored late playback done after barge-in`);
 				return;
 			}
-			finishSpeechPlayback("client playback done");
+			finishSpeechPlayback(runtime, "client playback done");
 			return;
 		}
 		if (msg.type === "tts_playback_error") {
-			if (bargeInActive) {
-				ttsLogger.log(`ignored late playback error after barge-in: ${msg.message}`);
+			if (runtime.bargeInActive) {
+				ttsLogger.log(`[${runtime.userId}] ignored late playback error after barge-in: ${msg.message}`);
 				return;
 			}
-			finishSpeechPlayback(`client playback error: ${msg.message}`);
+			finishSpeechPlayback(runtime, `client playback error: ${msg.message}`);
 			return;
 		}
-		if (msg.type === "abort") await abortRobotTurn("client abort");
-		if (msg.type === "barge_in") await handleBargeIn();
+		if (msg.type === "abort") await abortRobotTurn(runtime, "client abort");
+		if (msg.type === "barge_in") await handleBargeIn(runtime);
 		if (msg.type === "reset_session") {
-			serverLogger.log("session reset: client request");
-			await abortRobotTurn("reset: client request");
-			await harness.rebuildSession("client request");
+			serverLogger.log(`[${runtime.userId}] session reset: client request`);
+			await abortRobotTurn(runtime, "reset: client request");
+			await runtime.harness.rebuildSession("client request");
 		}
+		return;
 	}
-	if (event.type === "audio_frame") stt.handleAudioFrame(event.data);
+	if (event.type === "audio_frame") stt.handleAudioFrame(event.userId, event.data);
 }
 
 onShutdown(async () => {
 	tts.stop();
 	stt.stopChildProcess();
 	llama.stop();
-	robot.stop();
+	for (const runtime of userRuntimes.values()) runtime.robot.stop();
 	await logger.flush();
 });
 

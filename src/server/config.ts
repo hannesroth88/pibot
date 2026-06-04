@@ -10,12 +10,7 @@ export const serverConfig = {
 	publicDir: resolve(serverDir, "../../public"),
 	pibotCacheDir: process.env.PIBOT_CACHE_DIR ?? resolve(homedir(), ".cache/pibot"),
 	port: Number(process.env.PORT ?? 8010),
-	host: process.env.HOST ?? "127.0.0.1",
-	sttWorker: process.env.STT_WORKER ?? "parakeet-cpp",
-	sttWorkerBinaryPath: resolve(
-		serverDir,
-		`../../native/pibot-stt/target/release/pibot-stt-worker${process.platform === "win32" ? ".exe" : ""}`,
-	),
+	host: process.env.HOST ?? "0.0.0.0",
 	parakeetCppWorkerPath:
 		process.env.PARAKEET_CPP_WORKER_PATH ??
 		resolve(
@@ -28,8 +23,6 @@ export const serverConfig = {
 	sileroVadGgmlModelPath:
 		process.env.SILERO_VAD_GGML_MODEL_PATH ??
 		resolve(homedir(), "models/whisper-vad", process.env.SILERO_VAD_GGML_MODEL_FILE ?? "ggml-silero-v6.2.0.bin"),
-	parakeetTdtModelDir:
-		process.env.PARAKEET_TDT_MODEL_DIR ?? resolve(homedir(), "models/parakeet-tdt-0.6b-v3-onnx-int8"),
 	llamaBaseUrl: process.env.LLAMA_BASE_URL ?? "http://127.0.0.1:8080/v1",
 	llamaHost: process.env.LLAMA_HOST ?? "127.0.0.1",
 	llamaPort: Number(process.env.LLAMA_PORT ?? 8080),
@@ -52,4 +45,10 @@ export const serverConfig = {
 	version: String(Date.now()),
 	maxContextImages: Number(process.env.MAX_CONTEXT_IMAGES ?? 4),
 	memoryFile: process.env.MEMORY_FILE ?? "data/memories.json",
+	usersFile: process.env.USERS_FILE ?? "data/users.json",
+	sessionsFile: process.env.SESSIONS_FILE ?? "data/sessions.json",
+	userMemoryDir: process.env.USER_MEMORY_DIR ?? "data/user-memories",
+	adminUser: process.env.ADMIN_USER ?? "admin",
+	adminPassword: process.env.ADMIN_PASSWORD ?? "admin",
+	secureCookies: process.env.SECURE_COOKIES === "1",
 };

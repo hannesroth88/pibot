@@ -2,7 +2,17 @@
 
 Native C++ STT worker for pibot using `mudler/parakeet.cpp` GGUF models plus whisper.cpp's GGML Silero VAD.
 
-It reads length-prefixed 16-bit little-endian mono PCM frames from stdin and emits newline-delimited JSON events compatible with the existing STT service.
+It reads multiplexed binary input frames from stdin and emits newline-delimited JSON events. Every user-specific event includes `userId`.
+
+Input frame format:
+
+```text
+u8 type                  # 1 audio_frame, 2 close_user
+u32le userIdByteLength
+userIdUtf8
+u32le payloadByteLength
+payloadBytes             # PCM16LE mono audio for audio_frame, empty for close_user
+```
 
 ## Build
 
@@ -19,7 +29,7 @@ native/parakeet-cpp-stt/build/parakeet-cpp-stt-worker
 ## Run from the app
 
 ```bash
-STT_WORKER=parakeet-cpp npm run dev
+npm run dev
 ```
 
 By default the TypeScript server downloads:
@@ -32,11 +42,11 @@ By default the TypeScript server downloads:
 Override with:
 
 ```bash
-PARAKEET_CPP_MODEL_PATH=/path/to/model.gguf SILERO_VAD_GGML_MODEL_PATH=/path/to/ggml-silero.bin STT_WORKER=parakeet-cpp npm run dev
+PARAKEET_CPP_MODEL_PATH=/path/to/model.gguf SILERO_VAD_GGML_MODEL_PATH=/path/to/ggml-silero.bin npm run dev
 ```
 
 or:
 
 ```bash
-PARAKEET_CPP_MODEL_FILE=realtime_eou_120m-v1-q8_0.gguf STT_WORKER=parakeet-cpp npm run dev
+PARAKEET_CPP_MODEL_FILE=realtime_eou_120m-v1-q8_0.gguf npm run dev
 ```

@@ -11,12 +11,11 @@ public/app.js
 
 # local runtime data
 /data/*.json
+/data/user-memories/
 /data/voices/*
 !/data/voices/elevenlabs-pibot-reference*
 
 # native build artifacts
-native/pibot-stt/build/
-native/pibot-stt/target/
 native/qwen3_tts_rs/build/
 native/qwen3_tts_rs/target/
 models/

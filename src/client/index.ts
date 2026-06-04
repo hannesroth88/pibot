@@ -14,6 +14,11 @@ import { BrowserClientLogger } from "./logger.js";
 import { RobotServer } from "./robot-server.js";
 import { createRobotTools } from "./tools/index.js";
 
+const auth = document.querySelector<HTMLElement>("#auth");
+const loginForm = document.querySelector<HTMLFormElement>("#loginForm");
+const loginName = document.querySelector<HTMLInputElement>("#loginName");
+const loginPassword = document.querySelector<HTMLInputElement>("#loginPassword");
+const loginError = document.querySelector<HTMLElement>("#loginError");
 const setup = document.querySelector<HTMLElement>("#setup");
 const robot = document.querySelector<HTMLElement>("#robot");
 const logEl = document.querySelector<RobotLogElement>("#log");
@@ -25,6 +30,11 @@ const spotifyNowPlaying = document.querySelector<HTMLElement>("#spotifyNowPlayin
 const backButton = document.querySelector<HTMLButtonElement>("#back");
 
 if (
+	!auth ||
+	!loginForm ||
+	!loginName ||
+	!loginPassword ||
+	!loginError ||
 	!setup ||
 	!robot ||
 	!logEl ||
@@ -38,6 +48,11 @@ if (
 	throw new Error("Missing required DOM elements");
 }
 
+const authSection = auth;
+const loginFormElement = loginForm;
+const loginNameInput = loginName;
+const loginPasswordInput = loginPassword;
+const loginErrorElement = loginError;
 const robotLog = logEl;
 const robotFace = face;
 const setupPanelElement = setupPanel;
@@ -73,7 +88,7 @@ const micAudioConstraints: ExtendedMicAudioConstraints = {
 };
 const clientLogger = new BrowserClientLogger();
 
-let robotServer: RobotServer;
+let robotServer: RobotServer | undefined;
 let recognitionWanted = false;
 let micStream: MediaStream | undefined;
 let micAudioContext: AudioContext | undefined;
@@ -109,7 +124,7 @@ function log(text: string, tag = ""): void {
 }
 
 function send(data: ClientMessage): void {
-	robotServer.send(data);
+	robotServer?.send(data);
 }
 
 function deriveRobotFaceState(): RobotFaceState {
@@ -189,30 +204,34 @@ void tools.spotify
 	})
 	.catch((error: unknown) => log(`Spotify auth failed: ${stringifyLogValue(error)}`, "spotify"));
 
-robotServer = new RobotServer({
-	url: `${wsProtocol}://${location.host}`,
-	logger: clientLogger,
-	tools: tools.handlers,
-	tts: {
-		startPcmStream: tools.speech.startPcmStream,
-		pushPcmAudio: tools.speech.pushPcmAudio,
-		finishPcmStream: tools.speech.finishPcmStream,
-		failPcmStream: tools.speech.failPcmStream,
-	},
-	events: {
-		onState: (state) => {
-			serverRobotState = state;
-			if (state.phase !== "hearing") bargeInDetector.resetStreaming();
-			renderRobotFace();
+function initializeRobotServer(): void {
+	if (robotServer) return;
+	robotServer = new RobotServer({
+		url: `${wsProtocol}://${location.host}`,
+		logger: clientLogger,
+		tools: tools.handlers,
+		tts: {
+			startPcmStream: tools.speech.startPcmStream,
+			pushPcmAudio: tools.speech.pushPcmAudio,
+			finishPcmStream: tools.speech.finishPcmStream,
+			failPcmStream: tools.speech.failPcmStream,
 		},
-		onLog: (entry) => robotLog.appendLine(entry.origin, entry.tags, entry.message),
-		onRejected: (reason) => {
-			showErrorFor(5000);
-			robotLog.appendLine("client", ["error"], `connection rejected: ${reason}`);
+		events: {
+			onState: (state) => {
+				serverRobotState = state;
+				if (state.phase !== "hearing") bargeInDetector.resetStreaming();
+				renderRobotFace();
+			},
+			onLog: (entry) => robotLog.appendLine(entry.origin, entry.tags, entry.message),
+			onRejected: (reason) => {
+				showErrorFor(5000);
+				robotLog.appendLine("client", ["error"], `connection rejected: ${reason}`);
+			},
 		},
-	},
-});
-clientLogger.setSender((message) => robotServer.send(message));
+	});
+}
+
+clientLogger.setSender((message) => robotServer?.send(message));
 
 function micInputBlocked(): boolean {
 	return Date.now() < ignoreMicUntil;
@@ -222,7 +241,7 @@ function sendPcmToServer(pcm: Int16Array): void {
 	if (pcm.byteLength === 0) return;
 	const buffer = new ArrayBuffer(pcm.byteLength);
 	new Uint8Array(buffer).set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength));
-	robotServer.sendBinary(buffer);
+	robotServer?.sendBinary(buffer);
 }
 
 function startBargeInStream(preroll: Int16Array): void {
@@ -249,7 +268,7 @@ function resampleToPcm16(input: Float32Array, inputSampleRate: number): Int16Arr
 }
 
 function sendMicAudio(input: Float32Array, sampleRate: number): void {
-	if (!recognitionWanted || !robotServer.isOpen()) return;
+	if (!recognitionWanted || !robotServer?.isOpen()) return;
 	const pcm = resampleToPcm16(input, sampleRate);
 	const barge = bargeInDetector.observeMic(input, sampleRate, pcm, serverRobotState, ttsSpeaking);
 	if (barge.triggered) {
@@ -360,6 +379,56 @@ function connectReloadSocket(reloadOnOpen = false): void {
 connectReloadSocket();
 void pollReloadVersion();
 setInterval(() => void pollReloadVersion(), 2000);
+
+function showLogin(message = ""): void {
+	authSection.hidden = false;
+	setupSection.hidden = true;
+	robotSection.hidden = true;
+	loginErrorElement.textContent = message;
+}
+
+function showSetupAfterLogin(): void {
+	authSection.hidden = true;
+	setupSection.hidden = false;
+	robotSection.hidden = true;
+	moveFaceToSetup();
+	initializeRobotServer();
+}
+
+async function checkExistingSession(): Promise<void> {
+	try {
+		const response = await fetch("/api/me", { cache: "no-store" });
+		if (!response.ok) {
+			showLogin();
+			return;
+		}
+		showSetupAfterLogin();
+	} catch (error) {
+		showLogin(error instanceof Error ? error.message : String(error));
+	}
+}
+
+loginFormElement.addEventListener("submit", (event) => {
+	event.preventDefault();
+	loginErrorElement.textContent = "";
+	void fetch("/api/login", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ name: loginNameInput.value, password: loginPasswordInput.value }),
+	})
+		.then(async (response) => {
+			if (response.ok) {
+				loginPasswordInput.value = "";
+				showSetupAfterLogin();
+				return;
+			}
+			const body = (await response.json().catch(() => undefined)) as { error?: string } | undefined;
+			showLogin(body?.error ?? "Login failed");
+		})
+		.catch((error: unknown) => showLogin(error instanceof Error ? error.message : String(error)));
+});
+
+void checkExistingSession();
 
 async function enterRobotMode(): Promise<void> {
 	moveFaceToRobotMode();
@@ -480,4 +549,10 @@ setupPanelElement.addEventListener("reset-session", () => {
 	if (!confirm("Reset session? All context messages will be lost.")) return;
 	send({ type: "reset_session" });
 	log("session reset requested", "ui");
+});
+
+setupPanelElement.addEventListener("logout", () => {
+	void fetch("/api/logout", { method: "POST" })
+		.then(() => location.reload())
+		.catch((error: unknown) => log(`logout failed: ${stringifyLogValue(error)}`, "ui"));
 });

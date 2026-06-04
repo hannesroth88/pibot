@@ -3,14 +3,18 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 
-const DEFAULT_WORKER = "native/pibot-stt/target/release/pibot-stt-worker";
-const DEFAULT_MODEL_DIR = `${process.env.HOME}/models/parakeet-tdt-0.6b-v3-onnx-int8`;
+const DEFAULT_WORKER = "native/parakeet-cpp-stt/build/parakeet-cpp-stt-worker";
+const DEFAULT_MODEL = `${process.env.HOME}/models/parakeet-cpp-gguf/tdt-0.6b-v3-q8_0.gguf`;
+const DEFAULT_VAD_MODEL = `${process.env.HOME}/models/whisper-vad/ggml-silero-v6.2.0.bin`;
 const DEFAULT_AUDIO = "data/voices/elevenlabs-pibot-reference.wav";
+const USER_ID = "benchmark";
+const INPUT_AUDIO_FRAME = 1;
 
 function parseArgs(argv) {
 	const args = {
-		worker: process.env.PARAKEET_WORKER_PATH ?? DEFAULT_WORKER,
-		modelDir: process.env.PARAKEET_TDT_MODEL_DIR ?? DEFAULT_MODEL_DIR,
+		worker: process.env.PARAKEET_CPP_WORKER_PATH ?? DEFAULT_WORKER,
+		model: process.env.PARAKEET_CPP_MODEL_PATH ?? DEFAULT_MODEL,
+		vadModel: process.env.SILERO_VAD_GGML_MODEL_PATH ?? DEFAULT_VAD_MODEL,
 		audio: DEFAULT_AUDIO,
 		runs: 3,
 		minSilenceMs: 2000,
@@ -23,8 +27,13 @@ function parseArgs(argv) {
 			i++;
 			continue;
 		}
-		if (arg === "--model-dir" && next) {
-			args.modelDir = next;
+		if (arg === "--model" && next) {
+			args.model = next;
+			i++;
+			continue;
+		}
+		if (arg === "--vad-model" && next) {
+			args.vadModel = next;
 			i++;
 			continue;
 		}
@@ -50,7 +59,8 @@ function parseArgs(argv) {
 		throw new Error(`unknown or incomplete argument: ${arg}`);
 	}
 	if (!Number.isInteger(args.runs) || args.runs < 1) throw new Error("--runs must be an integer >= 1");
-	if (!Number.isInteger(args.minSilenceMs) || args.minSilenceMs < 1) throw new Error("--min-silence-ms must be an integer >= 1");
+	if (!Number.isInteger(args.minSilenceMs) || args.minSilenceMs < 1)
+		throw new Error("--min-silence-ms must be an integer >= 1");
 	return args;
 }
 
@@ -58,16 +68,18 @@ function printHelp() {
 	console.log(`Usage: node scripts/benchmark-stt.mjs [options]
 
 Options:
-  --worker PATH       STT worker path
-  --model-dir PATH    Parakeet model directory
-  --audio PATH        mono 16-bit WAV input (default: ${DEFAULT_AUDIO})
-  --runs N            number of utterance decodes (default: 3)
-  --min-silence-ms N  VAD end-of-speech silence (default: 2000)
+  --worker PATH          parakeet.cpp STT worker path
+  --model PATH           parakeet.cpp GGUF model path
+  --vad-model PATH       whisper.cpp Silero VAD GGML model path
+  --audio PATH           mono 16-bit WAV input (default: ${DEFAULT_AUDIO})
+  --runs N               number of utterance decodes (default: 3)
+  --min-silence-ms N     VAD end-of-speech silence (default: 2000)
 `);
 }
 
 function parseWav(buffer) {
-	if (buffer.toString("ascii", 0, 4) !== "RIFF" || buffer.toString("ascii", 8, 12) !== "WAVE") throw new Error("expected RIFF/WAVE file");
+	if (buffer.toString("ascii", 0, 4) !== "RIFF" || buffer.toString("ascii", 8, 12) !== "WAVE")
+		throw new Error("expected RIFF/WAVE file");
 	let offset = 12;
 	let format;
 	let data;
@@ -118,15 +130,19 @@ function wavToMono16kPcm(wav) {
 	return Buffer.from(resampleLinear(mono, wav.sampleRate, 16000).buffer);
 }
 
-function writeFrame(stdin, pcm) {
-	const header = Buffer.allocUnsafe(4);
-	header.writeUInt32LE(pcm.byteLength, 0);
+function writeFrame(stdin, userId, pcm) {
+	const userIdBytes = Buffer.from(userId, "utf8");
+	const header = Buffer.allocUnsafe(1 + 4 + userIdBytes.byteLength + 4);
+	header.writeUInt8(INPUT_AUDIO_FRAME, 0);
+	header.writeUInt32LE(userIdBytes.byteLength, 1);
+	userIdBytes.copy(header, 5);
+	header.writeUInt32LE(pcm.byteLength, 5 + userIdBytes.byteLength);
 	stdin.write(header);
 	stdin.write(pcm);
 }
 
 async function runDecode(args, pcm) {
-	const child = spawn(args.worker, [args.modelDir], {
+	const child = spawn(args.worker, [args.model, args.vadModel], {
 		env: { ...process.env, PARAKEET_MIN_SILENCE_MS: String(args.minSilenceMs), PARAKEET_PREROLL_MS: "0" },
 		stdio: ["pipe", "pipe", "pipe"],
 	});
@@ -157,13 +173,13 @@ async function runDecode(args, pcm) {
 		child.once("exit", () => reject(new Error("worker exited before ready")));
 	});
 	const started = performance.now();
-	writeFrame(child.stdin, pcm);
+	writeFrame(child.stdin, USER_ID, pcm);
 	const silence = Buffer.alloc(Math.ceil((16000 * args.minSilenceMs) / 1000) * 2, 0);
-	writeFrame(child.stdin, silence);
+	writeFrame(child.stdin, USER_ID, silence);
 	child.stdin.end();
 	const [code] = await new Promise((resolve) => child.once("exit", (...args) => resolve(args)));
 	if (code !== 0) throw new Error(`worker exited with code ${code}`);
-	const final = messages.find((message) => message.type === "final");
+	const final = messages.find((message) => message.type === "final" && message.userId === USER_ID);
 	if (!final) throw new Error(`no final STT result; messages=${JSON.stringify(messages)}`);
 	return { wallMs: performance.now() - started, duration: final.duration, decodeMs: final.decodeMs, text: final.text };
 }
@@ -174,14 +190,17 @@ async function main() {
 	const pcm = wavToMono16kPcm(wav);
 	const audioSeconds = pcm.byteLength / 2 / 16000;
 	console.log(`worker=${args.worker}`);
-	console.log(`modelDir=${args.modelDir}`);
+	console.log(`model=${args.model}`);
+	console.log(`vadModel=${args.vadModel}`);
 	console.log(`audio=${args.audio}`);
 	console.log(`audioSeconds=${audioSeconds.toFixed(2)} runs=${args.runs} minSilenceMs=${args.minSilenceMs}`);
 	console.log("run\twall_s\taudio_s\tdecode_ms\tdecode_rtf\twall_rtf");
 	for (let run = 1; run <= args.runs; run++) {
 		const result = await runDecode(args, pcm);
 		const decodeSeconds = result.decodeMs / 1000;
-		console.log(`${run}\t${(result.wallMs / 1000).toFixed(2)}\t${result.duration.toFixed(2)}\t${result.decodeMs}\t${(result.duration / decodeSeconds).toFixed(2)}\t${(result.duration / (result.wallMs / 1000)).toFixed(2)}`);
+		console.log(
+			`${run}\t${(result.wallMs / 1000).toFixed(2)}\t${result.duration.toFixed(2)}\t${result.decodeMs}\t${(result.duration / decodeSeconds).toFixed(2)}\t${(result.duration / (result.wallMs / 1000)).toFixed(2)}`,
+		);
 	}
 }
 

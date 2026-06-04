@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width,initial-scale=1" />
+		<meta http-equiv="Cache-Control" content="no-store" />
+		<meta http-equiv="Pragma" content="no-cache" />
+		<title>Pipi Admin</title>
+		<link rel="stylesheet" href="style.css?v=dev" />
+	</head>
+	<body>
+		<section id="auth" class="auth-panel">
+			<h1>Admin</h1>
+			<p>Add or remove Pipi users.</p>
+			<form id="addUserForm" class="panel">
+				<label>
+					Name
+					<input id="name" name="name" autocomplete="username" required />
+				</label>
+				<label>
+					Password
+					<input id="password" name="password" type="password" autocomplete="new-password" required />
+				</label>
+				<button class="primary" type="submit">save user</button>
+				<p id="status" class="error-text"></p>
+			</form>
+			<div class="panel admin-users">
+				<h2>Users</h2>
+				<div id="users"></div>
+			</div>
+		</section>
+		<script>
+			const form = document.querySelector("#addUserForm");
+			const nameInput = document.querySelector("#name");
+			const passwordInput = document.querySelector("#password");
+			const statusEl = document.querySelector("#status");
+			const usersEl = document.querySelector("#users");
+
+			function setStatus(message, isError = true) {
+				statusEl.textContent = message;
+				statusEl.style.color = isError ? "#ff8a8a" : "#6ee7a8";
+			}
+
+			async function request(path, options = {}) {
+				const response = await fetch(path, { cache: "no-store", ...options });
+				const body = await response.json().catch(() => ({}));
+				if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+				return body;
+			}
+
+			function renderUsers(users) {
+				usersEl.replaceChildren();
+				if (users.length === 0) {
+					usersEl.textContent = "No users yet.";
+					return;
+				}
+				for (const user of users) {
+					const row = document.createElement("div");
+					row.className = "admin-user-row";
+					const name = document.createElement("strong");
+					name.textContent = user.name;
+					const button = document.createElement("button");
+					button.type = "button";
+					button.textContent = "remove";
+					button.onclick = async () => {
+						if (!confirm(`Remove user ${user.name}? This also deletes their memories.`)) return;
+						try {
+							await request(`/api/admin/users/${encodeURIComponent(user.name)}`, { method: "DELETE" });
+							setStatus(`Removed ${user.name} and deleted memories.`, false);
+							await loadUsers();
+						} catch (error) {
+							setStatus(error instanceof Error ? error.message : String(error));
+						}
+					};
+					row.append(name, button);
+					usersEl.append(row);
+				}
+			}
+
+			async function loadUsers() {
+				const body = await request("/api/admin/users");
+				renderUsers(body.users || []);
+			}
+
+			form.addEventListener("submit", async (event) => {
+				event.preventDefault();
+				try {
+					await request("/api/admin/users", {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({ name: nameInput.value, password: passwordInput.value }),
+					});
+					setStatus(`Saved ${nameInput.value.trim().toLowerCase()}.`, false);
+					passwordInput.value = "";
+					await loadUsers();
+				} catch (error) {
+					setStatus(error instanceof Error ? error.message : String(error));
+				}
+			});
+
+			loadUsers().catch((error) => setStatus(error instanceof Error ? error.message : String(error)));
+		</script>
+	</body>
+</html>

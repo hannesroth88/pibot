@@ -9,7 +9,23 @@
 		<link rel="stylesheet" href="style.css?v=dev" />
 	</head>
 	<body>
-		<section id="setup">
+		<section id="auth" class="auth-panel">
+			<h1>Pipi</h1>
+			<p>Sign in to use the robot.</p>
+			<form id="loginForm" class="panel">
+				<label>
+					Name
+					<input id="loginName" name="name" autocomplete="username" required />
+				</label>
+				<label>
+					Password
+					<input id="loginPassword" name="password" type="password" autocomplete="current-password" required />
+				</label>
+				<button class="primary" type="submit">sign in</button>
+				<p id="loginError" class="error-text"></p>
+			</form>
+		</section>
+		<section id="setup" hidden>
 			<h1>Pipi</h1>
 			<p>Phone-powered robot.</p>
 			<div id="setupFaceHost" class="setup-face-host"></div>

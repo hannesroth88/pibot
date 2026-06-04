@@ -4,6 +4,7 @@ export class RobotSetupPanelElement extends HTMLElement {
 	private startButton: HTMLButtonElement | undefined;
 	private spotifyButton: HTMLButtonElement | undefined;
 	private resetButton: HTMLButtonElement | undefined;
+	private logoutButton: HTMLButtonElement | undefined;
 
 	connectedCallback(): void {
 		if (!this.startButton) this.render();
@@ -31,7 +32,10 @@ export class RobotSetupPanelElement extends HTMLElement {
 		this.resetButton = document.createElement("button");
 		this.resetButton.textContent = "Reset session";
 		this.resetButton.addEventListener("click", () => this.dispatchEvent(new Event("reset-session")));
-		controls.append(this.spotifyButton, this.resetButton);
+		this.logoutButton = document.createElement("button");
+		this.logoutButton.textContent = "Logout";
+		this.logoutButton.addEventListener("click", () => this.dispatchEvent(new Event("logout")));
+		controls.append(this.spotifyButton, this.resetButton, this.logoutButton);
 		this.replaceChildren(this.startButton, controls);
 	}
 }

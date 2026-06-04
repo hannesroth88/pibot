@@ -1,24 +1,29 @@
-import type { Server } from "node:http";
+import type { IncomingMessage, Server } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 import type { ClientMessage } from "../types.js";
+import type { AuthenticatedUser } from "./auth.js";
 import type { Logger } from "./logger.js";
 
+type AuthenticatedUpgradeRequest = IncomingMessage & { authenticatedUser?: AuthenticatedUser };
+
 export type WebsocketEvent =
-	| { type: "client_connected"; client: WebSocket }
-	| { type: "client_disconnected"; client: WebSocket }
-	| { type: "audio_frame"; data: Buffer }
-	| { type: "client_message"; message: ClientMessage };
+	| { type: "client_connected"; client: WebSocket; user: AuthenticatedUser; userId: string }
+	| { type: "client_disconnected"; client: WebSocket; userId: string }
+	| { type: "audio_frame"; userId: string; data: Buffer }
+	| { type: "client_message"; userId: string; message: ClientMessage };
 
 export interface WebsocketServer {
+	send: (userId: string, message: object) => void;
 	broadcast: (message: object) => void;
 }
 
 export function attachWebSockets(deps: {
 	server: Server;
 	logger: Logger;
+	authenticate: (req: IncomingMessage) => Promise<AuthenticatedUser | undefined>;
 	onEvent: (event: WebsocketEvent) => void | Promise<void>;
 }): WebsocketServer {
-	let activeClient: WebSocket | undefined;
+	const clients = new Map<string, WebSocket>();
 	const logger = deps.logger.tag("server");
 	const emit = (event: WebsocketEvent) => {
 		void Promise.resolve(deps.onEvent(event)).catch((error) => {
@@ -29,36 +34,59 @@ export function attachWebSockets(deps: {
 	const reloadWss = new WebSocketServer({ noServer: true });
 
 	deps.server.on("upgrade", (req, socket, head) => {
-		const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-		const target = url.pathname === "/__reload" ? reloadWss : robotWss;
-		target.handleUpgrade(req, socket, head, (ws) => target.emit("connection", ws, req));
+		void (async () => {
+			const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+			if (url.pathname === "/__reload") {
+				reloadWss.handleUpgrade(req, socket, head, (ws) => reloadWss.emit("connection", ws, req));
+				return;
+			}
+			const user = await deps.authenticate(req);
+			if (!user) {
+				socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+				socket.destroy();
+				return;
+			}
+			(req as AuthenticatedUpgradeRequest).authenticatedUser = user;
+			robotWss.handleUpgrade(req, socket, head, (ws) => robotWss.emit("connection", ws, req));
+		})().catch((error) => {
+			logger.tag("error").log(error instanceof Error ? error.message : String(error));
+			socket.destroy();
+		});
 	});
 
-	robotWss.on("connection", (ws) => {
-		if (activeClient?.readyState === WebSocket.OPEN) {
-			logger.log("rejected extra ws client");
-			ws.close(1008, "Only one client may connect");
+	robotWss.on("connection", (ws, req) => {
+		const user = (req as AuthenticatedUpgradeRequest).authenticatedUser;
+		if (!user) {
+			ws.close(1008, "Authentication required");
 			return;
 		}
-		activeClient = ws;
-		emit({ type: "client_connected", client: ws });
+		const userId = user.name;
+		const existingClient = clients.get(userId);
+		if (existingClient?.readyState === WebSocket.OPEN) {
+			logger.log(`rejected extra ws client for ${userId}`);
+			ws.close(1008, "This user is already connected");
+			return;
+		}
+		clients.set(userId, ws);
+		emit({ type: "client_connected", client: ws, user, userId });
 		ws.on("message", (data, isBinary) => {
 			try {
 				if (isBinary) {
 					emit({
 						type: "audio_frame",
+						userId,
 						data: Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer),
 					});
 					return;
 				}
-				emit({ type: "client_message", message: JSON.parse(String(data)) as ClientMessage });
+				emit({ type: "client_message", userId, message: JSON.parse(String(data)) as ClientMessage });
 			} catch (error) {
 				logger.tag("error").log(error instanceof Error ? error.message : String(error));
 			}
 		});
 		ws.on("close", () => {
-			if (activeClient === ws) activeClient = undefined;
-			emit({ type: "client_disconnected", client: ws });
+			if (clients.get(userId) === ws) clients.delete(userId);
+			emit({ type: "client_disconnected", client: ws, userId });
 		});
 	});
 
@@ -67,8 +95,15 @@ export function attachWebSockets(deps: {
 	});
 
 	return {
+		send: (userId: string, message: object) => {
+			const client = clients.get(userId);
+			if (client?.readyState === WebSocket.OPEN) client.send(JSON.stringify(message));
+		},
 		broadcast: (message: object) => {
-			if (activeClient?.readyState === WebSocket.OPEN) activeClient.send(JSON.stringify(message));
+			const text = JSON.stringify(message);
+			for (const client of clients.values()) {
+				if (client.readyState === WebSocket.OPEN) client.send(text);
+			}
 		},
 	};
 }

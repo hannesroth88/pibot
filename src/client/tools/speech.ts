@@ -1,6 +1,9 @@
 import type { RobotRpcMap } from "../../types.js";
 import type { ClientLogger } from "../logger.js";
 
+const pcmInitialPrebufferSeconds = 0.2;
+const pcmScheduleLeadSeconds = 0.02;
+
 interface ActiveSpeech {
 	generation: number;
 	resolve: (response: RobotRpcMap["speak"]["response"]) => void;
@@ -366,7 +369,7 @@ export function createSpeechTool(deps: {
 		activePcmStream = {
 			generation: ++ttsGeneration,
 			sampleRate,
-			nextPlayTime: context.currentTime + 0.05,
+			nextPlayTime: context.currentTime + pcmInitialPrebufferSeconds,
 			pendingSources: 0,
 			doneRequested: false,
 			finishResolve: undefined,
@@ -375,7 +378,7 @@ export function createSpeechTool(deps: {
 		};
 		deps.onSpeakingChange(true);
 		deps.setMicInputBlockedUntil(0);
-		logger.log(`Qwen3 PCM stream started sampleRate=${sampleRate}`);
+		logger.log(`Qwen3 PCM stream started sampleRate=${sampleRate} prebufferMs=${pcmInitialPrebufferSeconds * 1000}`);
 	}
 
 	function pushPcmAudio(pcm: Uint8Array): void {
@@ -395,7 +398,7 @@ export function createSpeechTool(deps: {
 			stream.pendingSources--;
 			maybeFinishPcmStream(stream);
 		};
-		const startAt = Math.max(stream.nextPlayTime, audioContext.currentTime + 0.01);
+		const startAt = Math.max(stream.nextPlayTime, audioContext.currentTime + pcmScheduleLeadSeconds);
 		source.start(startAt);
 		stream.nextPlayTime = startAt + audioBuffer.duration;
 	}

@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { extname, relative, resolve } from "node:path";
+import type { UserAuthService } from "./auth.js";
 
 export interface HttpServer {
 	server: Server;
@@ -21,9 +22,10 @@ async function serveStaticFile(
 	res: ServerResponse,
 	publicDir: string,
 	version: string,
+	pathOverride?: string,
 ): Promise<void> {
 	const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-	const path = url.pathname === "/" ? "/index.html" : url.pathname;
+	const path = pathOverride ?? (url.pathname === "/" ? "/index.html" : url.pathname);
 	const publicRoot = resolve(publicDir);
 	const file = resolve(publicRoot, `.${path}`);
 	const relativePath = relative(publicRoot, file);
@@ -55,15 +57,129 @@ async function serveStaticFile(
 	}
 }
 
-export function createHttpServer(deps: { publicDir: string; version: string }): HttpServer {
+function sendJson(res: ServerResponse, status: number, data: unknown, headers: Record<string, string> = {}): void {
+	res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...headers });
+	res.end(JSON.stringify(data));
+}
+
+function sendUnauthorizedAdmin(res: ServerResponse): void {
+	res.writeHead(401, { "www-authenticate": 'Basic realm="Pipi admin"', "cache-control": "no-store" });
+	res.end("admin credentials required");
+}
+
+async function readJson(req: IncomingMessage): Promise<unknown> {
+	const chunks: Buffer[] = [];
+	let total = 0;
+	for await (const chunk of req) {
+		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+		total += buffer.byteLength;
+		if (total > 16 * 1024) throw new Error("Request body too large");
+		chunks.push(buffer);
+	}
+	if (chunks.length === 0) return undefined;
+	return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+}
+
+function credentialsFromBody(body: unknown): { name: string; password: string } | undefined {
+	if (!body || typeof body !== "object") return undefined;
+	const record = body as Record<string, unknown>;
+	if (typeof record.name !== "string" || typeof record.password !== "string") return undefined;
+	return { name: record.name, password: record.password };
+}
+
+export function createHttpServer(deps: { publicDir: string; version: string; auth: UserAuthService }): HttpServer {
 	const server = createServer(async (req, res) => {
 		const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-		if (url.pathname === "/__version" && req.method === "GET") {
-			res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-			res.end(JSON.stringify({ version: deps.version }));
-			return;
+		try {
+			if (url.pathname === "/__version" && req.method === "GET") {
+				res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+				res.end(JSON.stringify({ version: deps.version }));
+				return;
+			}
+			if (url.pathname === "/api/me" && req.method === "GET") {
+				const user = await deps.auth.authenticateRequest(req);
+				if (!user) {
+					sendJson(res, 401, { ok: false, error: "not authenticated" });
+					return;
+				}
+				sendJson(res, 200, { ok: true, user: { name: user.name } });
+				return;
+			}
+			if (url.pathname === "/api/login" && req.method === "POST") {
+				const credentials = credentialsFromBody(await readJson(req));
+				if (!credentials) {
+					sendJson(res, 400, { ok: false, error: "name and password are required" });
+					return;
+				}
+				const user = await deps.auth.verifyUser(credentials.name, credentials.password);
+				if (!user) {
+					sendJson(res, 401, { ok: false, error: "invalid name or password" });
+					return;
+				}
+				const token = await deps.auth.createSession(user.name);
+				sendJson(
+					res,
+					200,
+					{ ok: true, user: { name: user.name } },
+					{ "set-cookie": deps.auth.sessionCookie(token) },
+				);
+				return;
+			}
+			if (url.pathname === "/api/logout" && req.method === "POST") {
+				await deps.auth.logout(req);
+				sendJson(res, 200, { ok: true }, { "set-cookie": deps.auth.clearSessionCookie() });
+				return;
+			}
+			if (url.pathname === "/api/admin/users") {
+				if (!deps.auth.isAdminRequest(req)) {
+					sendUnauthorizedAdmin(res);
+					return;
+				}
+				if (req.method === "GET") {
+					sendJson(res, 200, { ok: true, users: await deps.auth.listUsers() });
+					return;
+				}
+				if (req.method === "POST") {
+					const credentials = credentialsFromBody(await readJson(req));
+					if (!credentials) {
+						sendJson(res, 400, { ok: false, error: "name and password are required" });
+						return;
+					}
+					const user = await deps.auth.addUser(credentials.name, credentials.password);
+					sendJson(res, 200, { ok: true, user });
+					return;
+				}
+			}
+			if (url.pathname.startsWith("/api/admin/users/") && req.method === "DELETE") {
+				if (!deps.auth.isAdminRequest(req)) {
+					sendUnauthorizedAdmin(res);
+					return;
+				}
+				const name = decodeURIComponent(url.pathname.slice("/api/admin/users/".length));
+				if (!(await deps.auth.removeUser(name))) {
+					sendJson(res, 404, { ok: false, error: "user not found" });
+					return;
+				}
+				sendJson(res, 200, { ok: true });
+				return;
+			}
+			if (
+				(url.pathname === "/admin" || url.pathname === "/admin/" || url.pathname === "/admin.html") &&
+				!deps.auth.isAdminRequest(req)
+			) {
+				sendUnauthorizedAdmin(res);
+				return;
+			}
+			await serveStaticFile(
+				req,
+				res,
+				deps.publicDir,
+				deps.version,
+				url.pathname === "/admin" || url.pathname === "/admin/" ? "/admin.html" : undefined,
+			);
+		} catch (error) {
+			sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
 		}
-		await serveStaticFile(req, res, deps.publicDir, deps.version);
 	});
 	return { server };
 }
