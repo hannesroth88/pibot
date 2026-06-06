@@ -74,8 +74,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path "dist/${{ matrix.artifact_name }}" | Out-Null
           New-Item -ItemType Directory -Force -Path "release-assets" | Out-Null
-          Copy-Item "native/parakeet-cpp-stt/build-release/parakeet-cpp-stt-worker.exe" "dist/${{ matrix.artifact_name }}/"
-          Copy-Item "native/parakeet-cpp-stt/build-release/parakeet-cpp-transcribe.exe" "dist/${{ matrix.artifact_name }}/"
+          Copy-Item "native/parakeet-cpp-stt/build-release/${{ matrix.build_config }}/parakeet-cpp-stt-worker.exe" "dist/${{ matrix.artifact_name }}/"
+          Copy-Item "native/parakeet-cpp-stt/build-release/${{ matrix.build_config }}/parakeet-cpp-transcribe.exe" "dist/${{ matrix.artifact_name }}/"
           & "dist/${{ matrix.artifact_name }}/parakeet-cpp-transcribe.exe" --help
           Compress-Archive -Path "dist/${{ matrix.artifact_name }}" -DestinationPath "release-assets/${{ matrix.archive_name }}" -Force
           $hash = Get-FileHash "release-assets/${{ matrix.archive_name }}" -Algorithm SHA256
