@@ -2,6 +2,7 @@
 #include "model.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -170,7 +171,7 @@ static void ensure_model_file(const std::string& path) {
     std::filesystem::create_directories(std::filesystem::path(path).parent_path());
     const std::string file = std::filesystem::path(path).filename().string();
     const std::string url = std::string(PARAKEET_CPP_REPO) + "/" + file;
-    const std::string tmp_path = path + ".tmp-" + std::to_string(getpid());
+    const std::string tmp_path = path + ".tmp-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     std::filesystem::remove(tmp_path);
     std::cerr << "downloading parakeet.cpp model file " << file << "\n";
     const std::string command = "curl -fL --progress-bar -o \"" + tmp_path + "\" \"" + url + "\"";
