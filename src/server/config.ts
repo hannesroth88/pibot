@@ -30,7 +30,7 @@ export const serverConfig = {
 	llamaContextWindow: Number(process.env.LLAMA_CONTEXT_WINDOW ?? localLlmConfigs[localLlm].contextWindow),
 	llamaModelDir:
 		process.env.LLAMA_MODEL_DIR ?? resolve(homedir(), "models", localLlmConfigs[localLlm].defaultModelDirName),
-	qwen3TtsWorker: process.env.QWEN3_TTS_WORKER ?? "rust",
+	qwen3TtsWorker: process.env.QWEN3_TTS_WORKER ?? (process.platform === "darwin" ? "rust" : "disabled"),
 	qwen3TtsPythonCommand: process.env.QWEN3_TTS_PYTHON_COMMAND ?? "uv",
 	qwen3TtsPythonWorkerPath:
 		process.env.QWEN3_TTS_PYTHON_WORKER_PATH ?? resolve(serverDir, "../../scripts/qwen3-tts-worker.py"),

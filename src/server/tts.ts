@@ -23,7 +23,7 @@ const requiredRustTtsModelFiles = [
 	"speech_tokenizer/model.safetensors",
 ] as const;
 
-type TtsWorkerKind = "python" | "rust";
+type TtsWorkerKind = "disabled" | "python" | "rust";
 
 export interface TtsServiceDeps {
 	workerKind: string;
@@ -97,8 +97,8 @@ function decodeUtf8(payload: Uint8Array): string {
 }
 
 function parseWorkerKind(value: string): TtsWorkerKind {
-	if (value === "python" || value === "rust") return value;
-	throw new Error(`QWEN3_TTS_WORKER must be python or rust, got ${value}`);
+	if (value === "disabled" || value === "python" || value === "rust") return value;
+	throw new Error(`QWEN3_TTS_WORKER must be disabled, python, or rust, got ${value}`);
 }
 
 function shouldLogQwen3Line(line: string): boolean {
@@ -227,6 +227,8 @@ async function ensureRustTtsModel(modelDir: string, logger: Logger): Promise<voi
 
 export function createTtsService(deps: TtsServiceDeps): TtsService {
 	const workerKind = parseWorkerKind(deps.workerKind);
+	if (workerKind === "disabled") return createDisabledTtsService(deps.logger);
+
 	const qwen3ModelName = process.env.QWEN3_TTS_MODEL_NAME ?? "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-6bit";
 	const qwen3RefAudio = process.env.QWEN3_TTS_REF_AUDIO ?? "data/voices/elevenlabs-pibot-reference-de.wav";
 	const qwen3RefTextFile = process.env.QWEN3_TTS_REF_TEXT_FILE ?? "data/voices/elevenlabs-pibot-reference-de.txt";
@@ -498,4 +500,29 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 	startWorker();
 
 	return { ready, start, pushText, end, cancelUser, cancel, stop };
+}
+
+function createDisabledTtsService(logger: Logger): TtsService {
+	logger.tag("tts").log("TTS disabled; set QWEN3_TTS_WORKER=rust or QWEN3_TTS_WORKER=python to enable it");
+	const turns = new Map<string, TtsCallbacks>();
+	return {
+		ready: Promise.resolve(),
+		start: (userId, callbacks) => {
+			turns.set(userId, callbacks);
+		},
+		pushText: () => undefined,
+		end: (userId) => {
+			const callbacks = turns.get(userId);
+			if (!callbacks) return;
+			turns.delete(userId);
+			callbacks.onDone();
+		},
+		cancelUser: (userId) => {
+			turns.delete(userId);
+		},
+		cancel: () => {
+			turns.clear();
+		},
+		stop: () => undefined,
+	};
 }

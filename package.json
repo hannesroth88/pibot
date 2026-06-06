@@ -12,14 +12,14 @@
 		"submodules": "git submodule update --init --recursive",
 		"build:stt-parakeet-cpp": "cmake -S native/parakeet-cpp-stt -B native/parakeet-cpp-stt/build && cmake --build native/parakeet-cpp-stt/build -j",
 		"build:tts-rust": "npm run submodules -- native/qwen3_tts_rs && cargo build --release --no-default-features --features mlx --manifest-path native/qwen3_tts_rs/Cargo.toml --bin pibot-tts-worker",
-		"build:native": "npm run build:stt-parakeet-cpp && npm run build:tts-rust",
+		"build:native": "node scripts/build-native.mjs",
 		"check": "biome check --write --error-on-warnings . && tsc --noEmit && npm run compile:client",
 		"typecheck": "tsc --noEmit",
 		"prepare": "husky"
 	},
 	"dependencies": {
-		"@earendil-works/pi-agent-core": "file:/Users/badlogic/workspaces/pi/packages/agent",
-		"@earendil-works/pi-ai": "file:/Users/badlogic/workspaces/pi/packages/ai",
+		"@earendil-works/pi-agent-core": "0.78.1",
+		"@earendil-works/pi-ai": "0.78.1",
 		"@mozilla/readability": "^0.6.0",
 		"jsdom": "^29.1.1",
 		"tsx": "4.22.1",

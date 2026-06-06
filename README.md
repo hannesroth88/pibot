@@ -4,16 +4,27 @@ Pipi is a smartphone robot that can talk, remember things, take photos, and driv
 
 ## Requirements
 
-- Apple Silicon Mac with at least 32 GB unified memory.
+- macOS/Apple Silicon for local Qwen3-TTS speech synthesis.
+- Linux x86_64 is supported for LLM and STT; TTS is disabled by default on non-macOS.
 - The default local model set needs about 8-10 GB of unified memory at runtime.
-- Node.js 22+, Rust, Xcode command line tools, Xcode Metal Toolchain, CMake, pkg-config, Opus, and `tar`.
+- Node.js 22+, CMake, pkg-config, C/C++ build tools, and `tar`.
+- Rust, Xcode command line tools, Xcode Metal Toolchain, and Opus are required only for the macOS Qwen3-TTS worker.
 
-Install native build prerequisites:
+macOS native build prerequisites:
 
 ```bash
 brew install cmake pkg-config opus
 xcodebuild -downloadComponent MetalToolchain
 ```
+
+Ubuntu 26.04 native build prerequisites:
+
+```bash
+sudo apt install -y build-essential cmake pkg-config git curl tar \
+  mesa-vulkan-drivers vulkan-tools libvulkan-dev glslc libshaderc-dev spirv-tools
+```
+
+For AMD Strix Halo/Radeon 8060S, install ROCm 7.2.2 from AMD's noble repository if you want HIP/ROCm experiments. The default Linux STT build uses Vulkan.
 
 ## Setup
 
@@ -44,15 +55,17 @@ Pipi runs local LLM, STT, and TTS models. Missing default models are downloaded 
 
 - STT default: native `parakeet.cpp` GGUF worker with whisper.cpp GGML Silero VAD.
   - Build with `npm run build:stt-parakeet-cpp`.
+  - Uses Metal on Apple platforms and Vulkan on Linux by default.
   - Model: `mudler/parakeet-cpp-gguf/tdt-0.6b-v3-q8_0.gguf`.
   - Downloaded into: `~/models/parakeet-cpp-gguf/tdt-0.6b-v3-q8_0.gguf`.
   - VAD model: `ggml-org/whisper-vad/ggml-silero-v6.2.0.bin`.
   - Downloaded into: `~/models/whisper-vad/ggml-silero-v6.2.0.bin`.
   - Override with `PARAKEET_CPP_MODEL_PATH`/`PARAKEET_CPP_MODEL_FILE` and `SILERO_VAD_GGML_MODEL_PATH`/`SILERO_VAD_GGML_MODEL_FILE`.
 
-- TTS: Qwen3-TTS 0.6B Base 6-bit MLX.
+- TTS: Qwen3-TTS 0.6B Base 6-bit MLX on macOS/Apple Silicon.
   - Model: `mlx-community/Qwen3-TTS-12Hz-0.6B-Base-6bit`
   - Downloaded into: `~/models/qwen3-tts-12hz-0.6b-base-6bit`
+  - Disabled by default on Linux because this worker depends on Apple MLX.
 
 ## Commands
 

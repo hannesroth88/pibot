@@ -46,7 +46,8 @@ Backend::Backend(int n_threads) : impl_(new Impl()) {
     if (!force_cpu) {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 ggml_backend_t gpu = ggml_backend_dev_init(dev, nullptr);
                 if (gpu) {
                     impl_->backends.push_back(gpu);
