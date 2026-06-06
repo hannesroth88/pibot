@@ -1,0 +1,97 @@
+name: parakeet.cpp STT release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to create/update, e.g. parakeet-cpp-stt-v0.1.0"
+        required: true
+        type: string
+  push:
+    tags:
+      - "parakeet-cpp-stt-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.artifact_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact_name: pibot-parakeet-linux-x64-vulkan
+            archive_name: pibot-parakeet-linux-x64-vulkan.tar.gz
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DPARAKEET_CPP_STT_VULKAN=ON
+            build_config: Release
+            exe_suffix: ""
+          - os: macos-14
+            artifact_name: pibot-parakeet-macos-arm64-metal
+            archive_name: pibot-parakeet-macos-arm64-metal.tar.gz
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DPARAKEET_CPP_STT_METAL=ON
+            build_config: Release
+            exe_suffix: ""
+          - os: windows-2025
+            artifact_name: pibot-parakeet-windows-x64-cpu
+            archive_name: pibot-parakeet-windows-x64-cpu.zip
+            cmake_args: -DPARAKEET_CPP_STT_VULKAN=OFF
+            build_config: Release
+            exe_suffix: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential cmake git libvulkan-dev glslc libshaderc-dev spirv-tools mesa-vulkan-drivers vulkan-tools
+
+      - name: Configure
+        run: cmake -S native/parakeet-cpp-stt -B native/parakeet-cpp-stt/build-release ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build native/parakeet-cpp-stt/build-release --config ${{ matrix.build_config }} --target parakeet-cpp-stt-worker parakeet-cpp-transcribe -j
+
+      - name: Stage Unix binaries
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/${{ matrix.artifact_name }} release-assets
+          cp native/parakeet-cpp-stt/build-release/parakeet-cpp-stt-worker dist/${{ matrix.artifact_name }}/
+          cp native/parakeet-cpp-stt/build-release/parakeet-cpp-transcribe dist/${{ matrix.artifact_name }}/
+          chmod +x dist/${{ matrix.artifact_name }}/parakeet-cpp-stt-worker dist/${{ matrix.artifact_name }}/parakeet-cpp-transcribe
+          dist/${{ matrix.artifact_name }}/parakeet-cpp-transcribe --help
+          tar -C dist -czf release-assets/${{ matrix.archive_name }} ${{ matrix.artifact_name }}
+          (cd release-assets && shasum -a 256 ${{ matrix.archive_name }} > ${{ matrix.archive_name }}.sha256)
+
+      - name: Stage Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/${{ matrix.artifact_name }}" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release-assets" | Out-Null
+          Copy-Item "native/parakeet-cpp-stt/build-release/parakeet-cpp-stt-worker.exe" "dist/${{ matrix.artifact_name }}/"
+          Copy-Item "native/parakeet-cpp-stt/build-release/parakeet-cpp-transcribe.exe" "dist/${{ matrix.artifact_name }}/"
+          & "dist/${{ matrix.artifact_name }}/parakeet-cpp-transcribe.exe" --help
+          Compress-Archive -Path "dist/${{ matrix.artifact_name }}" -DestinationPath "release-assets/${{ matrix.archive_name }}" -Force
+          $hash = Get-FileHash "release-assets/${{ matrix.archive_name }}" -Algorithm SHA256
+          "$($hash.Hash.ToLower())  ${{ matrix.archive_name }}" | Out-File -Encoding ascii "release-assets/${{ matrix.archive_name }}.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release-assets/*
+          if-no-files-found: error
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          files: release-assets/*
+          generate_release_notes: true

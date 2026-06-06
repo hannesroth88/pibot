@@ -58,6 +58,7 @@ Pipi runs local LLM, STT, and TTS models. Missing default models are downloaded 
 - STT default: native `parakeet.cpp` GGUF worker with whisper.cpp GGML Silero VAD.
   - Build with `npm run build:stt-parakeet-cpp`.
   - Uses Metal on Apple platforms and Vulkan on Linux by default.
+  - Prebuilt STT worker archives are published from the `parakeet-cpp-stt-v*` GitHub release workflow for Linux x64 Vulkan, macOS arm64 Metal, and Windows x64 CPU.
   - Model: `mudler/parakeet-cpp-gguf/tdt-0.6b-v3-q8_0.gguf`.
   - Downloaded into: `~/models/parakeet-cpp-gguf/tdt-0.6b-v3-q8_0.gguf`.
   - VAD model: `ggml-org/whisper-vad/ggml-silero-v6.2.0.bin`.
