@@ -12,7 +12,7 @@
 		"submodules": "git submodule update --init --recursive",
 		"build:stt-parakeet-cpp": "cmake -S native/parakeet-cpp-stt -B native/parakeet-cpp-stt/build && cmake --build native/parakeet-cpp-stt/build -j",
 		"build:tts-rust": "npm run submodules -- native/qwen3_tts_rs && cargo build --release --no-default-features --features mlx --manifest-path native/qwen3_tts_rs/Cargo.toml --bin pibot-tts-worker",
-		"build:tts-cpp": "npm run submodules -- native/qwen3-tts.cpp && cmake -S native/qwen3-tts.cpp/ggml -B native/qwen3-tts.cpp/ggml/build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON && cmake --build native/qwen3-tts.cpp/ggml/build -j && cmake -S native/qwen3-tts.cpp -B native/qwen3-tts.cpp/build -DQWEN3_TTS_COREML=OFF && cmake --build native/qwen3-tts.cpp/build --target qwen3-tts-worker qwen3-tts-cli -j",
+		"build:tts-cpp": "node scripts/build-qwen3-tts-cpp.mjs",
 		"build:native": "node scripts/build-native.mjs",
 		"build:natives": "node scripts/build-native.mjs",
 		"check": "biome check --write --error-on-warnings . && tsc --noEmit && npm run compile:client",

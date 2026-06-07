@@ -526,7 +526,7 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 }
 
 function createDisabledTtsService(logger: Logger): TtsService {
-	logger.tag("tts").log("TTS disabled; set QWEN3_TTS_WORKER=rust or QWEN3_TTS_WORKER=python to enable it");
+	logger.tag("tts").log("TTS disabled; set QWEN3_TTS_WORKER=cpp, rust, or python to enable it");
 	const turns = new Map<string, TtsCallbacks>();
 	return {
 		ready: Promise.resolve(),

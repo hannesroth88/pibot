@@ -18,8 +18,4 @@ function run(command, args) {
 
 await run("npm", ["run", "build:stt-parakeet-cpp"]);
 
-if (process.platform === "darwin") {
-	await run("npm", ["run", "build:tts-cpp"]);
-} else {
-	console.log("Skipping Qwen3-TTS native build: C++/Metal worker is macOS-only for now (Linux/Windows via Vulkan TBD).");
-}
+await run("npm", ["run", "build:tts-cpp"]);
