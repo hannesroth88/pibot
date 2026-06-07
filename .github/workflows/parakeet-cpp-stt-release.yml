@@ -34,9 +34,9 @@ jobs:
             build_config: Release
             exe_suffix: ""
           - os: windows-2025
-            artifact_name: pibot-parakeet-windows-x64-cpu
-            archive_name: pibot-parakeet-windows-x64-cpu.zip
-            cmake_args: -DPARAKEET_CPP_STT_VULKAN=OFF
+            artifact_name: pibot-parakeet-windows-x64-vulkan
+            archive_name: pibot-parakeet-windows-x64-vulkan.zip
+            cmake_args: -DPARAKEET_CPP_STT_VULKAN=ON
             build_config: Release
             exe_suffix: ".exe"
     runs-on: ${{ matrix.os }}
@@ -48,6 +48,11 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y build-essential cmake git libvulkan-dev glslc libshaderc-dev spirv-tools mesa-vulkan-drivers vulkan-tools
+
+      - name: Install Windows build dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install vulkan-sdk --no-progress -y
 
       - name: Configure
         run: cmake -S native/parakeet-cpp-stt -B native/parakeet-cpp-stt/build-release ${{ matrix.cmake_args }}
