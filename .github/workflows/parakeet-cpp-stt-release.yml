@@ -52,7 +52,14 @@ jobs:
       - name: Install Windows build dependencies
         if: runner.os == 'Windows'
         shell: pwsh
-        run: choco install vulkan-sdk --no-progress -y
+        run: |
+          choco install vulkan-sdk --no-progress -y
+          $vulkanSdk = Get-ChildItem "C:/VulkanSDK" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if ($null -eq $vulkanSdk) {
+            throw "Vulkan SDK install directory not found"
+          }
+          "VULKAN_SDK=$($vulkanSdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$($vulkanSdk.FullName)/Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Configure
         run: cmake -S native/parakeet-cpp-stt -B native/parakeet-cpp-stt/build-release ${{ matrix.cmake_args }}
