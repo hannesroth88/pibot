@@ -83,7 +83,7 @@ set(WHISPER_SDL2 OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   whisper_cpp
   GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
-  GIT_TAG master
+  GIT_TAG v1.8.7
 )
 FetchContent_MakeAvailable(whisper_cpp)
 

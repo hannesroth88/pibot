@@ -1,4 +1,5 @@
 import { watch } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import * as esbuild from "esbuild";
@@ -10,6 +11,24 @@ let server;
 let restartTimer;
 let restarting = false;
 let pendingRestart = false;
+
+async function loadDotEnv() {
+	try {
+		const text = await readFile(resolve(root, ".env"), "utf8");
+		for (const line of text.split("\n")) {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith("#")) continue;
+			const eq = trimmed.indexOf("=");
+			if (eq < 0) continue;
+			const key = trimmed.slice(0, eq).trim();
+			const value = trimmed.slice(eq + 1).trim();
+			if (key && !(key in process.env)) process.env[key] = value;
+		}
+	} catch {
+		// no .env file, fine
+	}
+}
+
 
 function log(message) {
 	console.log(`[dev] ${message}`);
@@ -108,4 +127,5 @@ process.on("SIGTERM", async () => {
 	process.exit(143);
 });
 
+await loadDotEnv();
 await restart("initial start");
