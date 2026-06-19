@@ -11,6 +11,7 @@ public/app.js
 
 # local runtime data
 /data/*.json
+/data/ssl/
 /data/user-memories/
 /data/voices/*
 !/data/voices/elevenlabs-pibot-reference*

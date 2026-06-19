@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer as createHttpServer_, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { extname, relative, resolve } from "node:path";
 import type { UserAuthService } from "./auth.js";
 
@@ -22,6 +23,7 @@ async function serveStaticFile(
 	res: ServerResponse,
 	publicDir: string,
 	version: string,
+	usbEnabled: boolean,
 	pathOverride?: string,
 ): Promise<void> {
 	const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
@@ -47,7 +49,8 @@ async function serveStaticFile(
 				data
 					.toString("utf8")
 					.replaceAll("style.css?v=dev", `style.css?v=${version}`)
-					.replaceAll("app.js?v=dev", `app.js?v=${version}`),
+					.replaceAll("app.js?v=dev", `app.js?v=${version}`)
+					.replaceAll("__USB_ENABLED__", String(usbEnabled)),
 			);
 			return;
 		}
@@ -87,8 +90,14 @@ function credentialsFromBody(body: unknown): { name: string; password: string } 
 	return { name: record.name, password: record.password };
 }
 
-export function createHttpServer(deps: { publicDir: string; version: string; auth: UserAuthService }): HttpServer {
-	const server = createServer(async (req, res) => {
+export function createHttpServer(deps: {
+	publicDir: string;
+	version: string;
+	auth: UserAuthService;
+	ssl?: { key: Buffer; cert: Buffer };
+	usbEnabled: boolean;
+}): HttpServer {
+	const handler = async (req: IncomingMessage, res: ServerResponse) => {
 		const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 		try {
 			if (url.pathname === "/__version" && req.method === "GET") {
@@ -175,11 +184,13 @@ export function createHttpServer(deps: { publicDir: string; version: string; aut
 				res,
 				deps.publicDir,
 				deps.version,
+				deps.usbEnabled,
 				url.pathname === "/admin" || url.pathname === "/admin/" ? "/admin.html" : undefined,
 			);
 		} catch (error) {
 			sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
 		}
-	});
+	};
+	const server = deps.ssl ? createHttpsServer(deps.ssl, handler) : createHttpServer_(handler);
 	return { server };
 }

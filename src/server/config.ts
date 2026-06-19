@@ -54,4 +54,7 @@ export const serverConfig = {
 	adminUser: process.env.ADMIN_USER ?? "admin",
 	adminPassword: process.env.ADMIN_PASSWORD ?? "admin",
 	secureCookies: process.env.SECURE_COOKIES === "1",
+	sslKeyFile: process.env.SSL_KEY_FILE,
+	sslCertFile: process.env.SSL_CERT_FILE,
+	usbEnabled: process.env.USB_ENABLED !== "0",
 };

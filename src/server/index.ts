@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { RobotState, ServerMessage } from "../types.js";
@@ -89,10 +90,16 @@ const stt = createSttService({
 	logger,
 	onEvent: handleSttEvent,
 });
+const ssl =
+	serverConfig.sslKeyFile && serverConfig.sslCertFile
+		? { key: await readFile(serverConfig.sslKeyFile), cert: await readFile(serverConfig.sslCertFile) }
+		: undefined;
 const http = createHttpServer({
 	publicDir: serverConfig.publicDir,
 	version: serverConfig.version,
 	auth,
+	ssl,
+	usbEnabled: serverConfig.usbEnabled,
 });
 const websockets = createWebSocketServer({
 	server: http.server,
@@ -566,5 +573,5 @@ onShutdown(async () => {
 });
 
 http.server.listen(serverConfig.port, serverConfig.host, () =>
-	serverLogger.log(`robot demo: http://${serverConfig.host}:${serverConfig.port}`),
+	serverLogger.log(`robot demo: ${ssl ? "https" : "http"}://${serverConfig.host}:${serverConfig.port}`),
 );

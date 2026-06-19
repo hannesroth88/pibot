@@ -1,4 +1,7 @@
 import type { ClientMessage, RobotState } from "../types.js";
+
+declare const __USB_ENABLED__: boolean;
+
 import "./components/robot-face-webgl.js";
 import type { RobotFaceState, RobotFaceWebglElement } from "./components/robot-face-webgl.js";
 import "./components/robot-log.js";
@@ -427,6 +430,8 @@ loginFormElement.addEventListener("submit", (event) => {
 
 void checkExistingSession();
 
+let wakeLock: WakeLockSentinel | undefined;
+
 async function enterRobotMode(): Promise<void> {
 	moveFaceToRobotMode();
 	setupSection.hidden = true;
@@ -435,6 +440,14 @@ async function enterRobotMode(): Promise<void> {
 		if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
 	} catch (error) {
 		log(`Fullscreen request failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!wakeLock || wakeLock.released) {
+		try {
+			wakeLock = await navigator.wakeLock.request("screen");
+			log("Screen wake lock acquired", "stt");
+		} catch (error) {
+			log(`Wake lock failed: ${error instanceof Error ? error.message : String(error)}`, "stt");
+		}
 	}
 }
 
@@ -447,8 +460,12 @@ async function startRobot(): Promise<void> {
 	try {
 		tools.speech.enableTts();
 		log("TTS enabled: Qwen3 local clone", "stt");
-		const usbOk = await tools.motor.connectFt232h(true);
-		if (!usbOk) log("FT232H not connected; motor tools will report errors", "hardware");
+		if (__USB_ENABLED__) {
+			const usbOk = await tools.motor.connectFt232h(true);
+			if (!usbOk) log("FT232H not connected; motor tools will report errors", "hardware");
+		} else {
+			log("USB disabled (USB_ENABLED=0); skipping FT232H", "hardware");
+		}
 		await tools.motor
 			.startOrientationTracking()
 			.catch((error) =>
@@ -524,6 +541,17 @@ backButton.onclick = async () => {
 		log(`Fullscreen exit failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 };
+
+document.addEventListener("visibilitychange", () => {
+	if (document.visibilityState === "visible" && !robot.hidden && (!wakeLock || wakeLock.released)) {
+		navigator.wakeLock
+			.request("screen")
+			.then((lock) => {
+				wakeLock = lock;
+			})
+			.catch(() => undefined);
+	}
+});
 
 document.addEventListener("fullscreenchange", () => {
 	if (!document.fullscreenElement && !robot.hidden) {
