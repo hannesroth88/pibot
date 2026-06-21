@@ -397,8 +397,27 @@ function sanitizeTextForTts(text: string): string {
 	return text.replace(/\p{Emoji_Presentation}|\p{Extended_Pictographic}|\uFE0F/gu, " ").replace(/\s+/g, " ");
 }
 
-function logToolResult(name: string, result: unknown): void {
+function logToolResult(name: string, result: unknown, isError: boolean): void {
+	if (isError) {
+		const content =
+			result &&
+			typeof result === "object" &&
+			"content" in result &&
+			Array.isArray((result as { content: unknown }).content)
+				? (result as { content: Array<{ type: string; text?: string }> }).content
+						.filter((c) => c.type === "text")
+						.map((c) => c.text ?? "")
+						.join(" ")
+						.trim()
+				: String(result);
+		agentLogger.log(`tool ${name} error: ${content}`);
+		return;
+	}
 	if (name === "spotify_search") agentLogger.log(`spotify_search result ${JSON.stringify(result)}`);
+	if (name === "web_search" && result && typeof result === "object" && "results" in result) {
+		const r = result as { query: string; count: number; results: Array<{ title: string; url: string }> };
+		agentLogger.log(`web_search "${r.query}" => ${r.results.length} results`);
+	}
 }
 
 function handleAssistantTextDelta(runtime: UserRuntime, text: string): void {
@@ -421,7 +440,7 @@ async function handleHarnessEvent(runtime: UserRuntime, event: RobotHarnessEvent
 		if (event.type === "tool_end") {
 			runtime.activeToolState = undefined;
 			agentLogger.log(`[${runtime.userId}] tool ${event.name} finished${event.isError ? " with error" : ""}`);
-			logToolResult(event.name, event.result);
+			logToolResult(event.name, event.result, event.isError);
 		}
 		if (event.type !== "tool_end") agentLogger.log(`[${runtime.userId}] ignored stale ${event.type} during barge-in`);
 		return;
@@ -446,7 +465,7 @@ async function handleHarnessEvent(runtime: UserRuntime, event: RobotHarnessEvent
 	if (event.type === "tool_end") {
 		runtime.activeToolState = undefined;
 		agentLogger.log(`[${runtime.userId}] tool ${event.name} finished${event.isError ? " with error" : ""}`);
-		logToolResult(event.name, event.result);
+		logToolResult(event.name, event.result, event.isError);
 	}
 	if (event.type === "assistant_end") {
 		if (event.text) agentLogger.log(`[${runtime.userId}] LLM: ${event.text}`);

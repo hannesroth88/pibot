@@ -164,7 +164,9 @@ export async function createRobotHarness(deps: {
 	let harness = await buildHarness();
 
 	async function buildHarness(): Promise<AgentHarness> {
-		const session = await sessionRepo.create({ id: `robot-demo-${Date.now()}` });
+		const session = await sessionRepo.create({
+			id: `robot-demo-${Date.now()}`,
+		});
 		const newHarness = new AgentHarness({
 			env: deps.env,
 			session,
@@ -198,16 +200,31 @@ export async function createRobotHarness(deps: {
 				event.message.role === "assistant" &&
 				event.assistantMessageEvent.type === "text_delta"
 			) {
-				await emit({ type: "assistant_delta", text: event.assistantMessageEvent.delta });
+				await emit({
+					type: "assistant_delta",
+					text: event.assistantMessageEvent.delta,
+				});
 			}
 			if (event.type === "tool_execution_start") {
-				await emit({ type: "tool_start", name: event.toolName, args: event.args });
+				await emit({
+					type: "tool_start",
+					name: event.toolName,
+					args: event.args,
+				});
 			}
 			if (event.type === "tool_execution_end") {
-				await emit({ type: "tool_end", name: event.toolName, result: event.result, isError: event.isError });
+				await emit({
+					type: "tool_end",
+					name: event.toolName,
+					result: event.result,
+					isError: event.isError,
+				});
 			}
 			if (event.type === "message_end" && event.message.role === "assistant") {
-				await emit({ type: "assistant_end", text: extractAssistantText(event.message) });
+				await emit({
+					type: "assistant_end",
+					text: extractAssistantText(event.message),
+				});
 			}
 		});
 		return newHarness;

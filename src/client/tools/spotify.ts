@@ -492,6 +492,7 @@ export function createSpotifyTool(deps: {
 		payload: RobotRpcMap["spotify"]["request"],
 		signal: AbortSignal,
 	): Promise<RobotRpcMap["spotify"]["response"]> {
+		logger.log(`handle action=${payload.action} connected=${isConnected()}`);
 		try {
 			throwIfAborted(signal);
 			if (payload.action === "search") {

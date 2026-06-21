@@ -1,11 +1,26 @@
+import { existsSync, readFileSync } from "node:fs";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
+import { Agent } from "undici";
 
 const braveApiKey = process.env.BRAVE_API_KEY;
+
+const systemCaPaths = ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"];
+
+function buildSystemCaAgent(): Agent | undefined {
+	for (const caPath of systemCaPaths) {
+		if (existsSync(caPath)) {
+			return new Agent({ connect: { ca: readFileSync(caPath) } });
+		}
+	}
+	return undefined;
+}
+
+const braveAgent = buildSystemCaAgent();
 
 const webSearchParameters = Type.Object({
 	query: Type.String({ description: "Search query." }),
@@ -90,13 +105,26 @@ async function searchWebWithBrave(
 	url.searchParams.set("search_lang", "de");
 	url.searchParams.set("ui_lang", "de-DE");
 	if (freshness) url.searchParams.set("freshness", freshness);
-	const response = await fetch(url, {
-		headers: {
-			accept: "application/json",
-			"accept-encoding": "gzip",
-			"x-subscription-token": braveApiKey,
-		},
-	});
+	let response: Response;
+	try {
+		response = await fetch(url, {
+			headers: {
+				accept: "application/json",
+				"accept-encoding": "gzip",
+				"x-subscription-token": braveApiKey,
+			},
+			// @ts-expect-error undici dispatcher not in fetch types
+			dispatcher: braveAgent,
+		});
+	} catch (error) {
+		const cause =
+			error instanceof Error && error.cause instanceof Error
+				? error.cause.message
+				: error instanceof Error
+					? error.message
+					: String(error);
+		throw new Error(`Brave Search network error: ${cause}`);
+	}
 	if (!response.ok) {
 		const body = await response.text().catch(() => "");
 		throw new Error(`Brave Search failed: HTTP ${response.status}${body ? ` ${body.slice(0, 300)}` : ""}`);

@@ -1,6 +1,6 @@
 import type { ClientMessage, RobotState } from "../types.js";
 
-declare const __USB_ENABLED__: boolean;
+const usbEnabled = (window as unknown as { __USB_ENABLED__?: boolean }).__USB_ENABLED__ ?? true;
 
 import "./components/robot-face-webgl.js";
 import type { RobotFaceState, RobotFaceWebglElement } from "./components/robot-face-webgl.js";
@@ -460,7 +460,7 @@ async function startRobot(): Promise<void> {
 	try {
 		tools.speech.enableTts();
 		log("TTS enabled: Qwen3 local clone", "stt");
-		if (__USB_ENABLED__) {
+		if (usbEnabled) {
 			const usbOk = await tools.motor.connectFt232h(true);
 			if (!usbOk) log("FT232H not connected; motor tools will report errors", "hardware");
 		} else {

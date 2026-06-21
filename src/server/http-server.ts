@@ -50,7 +50,7 @@ async function serveStaticFile(
 					.toString("utf8")
 					.replaceAll("style.css?v=dev", `style.css?v=${version}`)
 					.replaceAll("app.js?v=dev", `app.js?v=${version}`)
-					.replaceAll("__USB_ENABLED__", String(usbEnabled)),
+					.replaceAll("__USB_ENABLED_VALUE__", String(usbEnabled)),
 			);
 			return;
 		}

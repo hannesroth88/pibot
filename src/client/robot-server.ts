@@ -149,11 +149,15 @@ export class RobotServer {
 	private async handleRequest(message: RobotWireRequest): Promise<void> {
 		const controller = new AbortController();
 		this.activeRobotRequests.set(message.id, { type: message.request.type, controller });
+		this.logger.tag("robot").log(`rpc start ${message.request.type} id=${message.id}`);
 		try {
 			const payload = await this.executeRequest(message, controller.signal);
+			this.logger.tag("robot").log(`rpc done ${message.request.type} id=${message.id}`);
 			this.sendResponse(message.id, message.request.type, payload);
 		} catch (error) {
-			this.sendError(message.id, message.request.type, error instanceof Error ? error.message : String(error));
+			const msg = error instanceof Error ? error.message : String(error);
+			this.logger.tag("robot").log(`rpc error ${message.request.type} id=${message.id}: ${msg}`);
+			this.sendError(message.id, message.request.type, msg);
 		} finally {
 			this.activeRobotRequests.delete(message.id);
 		}
