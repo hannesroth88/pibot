@@ -10,9 +10,9 @@ import { pageContentTool, webSearchTool } from "./websearch.js";
 
 export { pruneImagesForContext } from "./context.js";
 
-export function createRobotTools(robot: RobotClient, memoryStore: MemoryStore): AgentTool[] {
+export function createRobotTools(robot: RobotClient, memoryStore: MemoryStore, esp32Url?: string): AgentTool[] {
 	return [
-		...createMotorTools(robot),
+		...createMotorTools(robot, esp32Url),
 		createPhotoTool(robot),
 		...createSpotifyTools(robot),
 		sleepTool,

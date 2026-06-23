@@ -147,11 +147,12 @@ export async function createRobotHarness(deps: {
 	localContextWindow: number;
 	maxContextImages: number;
 	robot: RobotClient;
+	esp32Url: string | undefined;
 	onEvent: (event: RobotHarnessEvent) => void | Promise<void>;
 	beforeTool: (name: string, args: unknown) => void | Promise<void>;
 }): Promise<RobotHarness> {
 	const sessionRepo = new InMemorySessionRepo();
-	const tools = createRobotTools(deps.robot, deps.memoryStore);
+	const tools = createRobotTools(deps.robot, deps.memoryStore, deps.esp32Url);
 	const contextLogger = deps.logger.tag("context");
 	const emit = async (event: RobotHarnessEvent): Promise<void> => {
 		try {

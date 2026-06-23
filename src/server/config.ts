@@ -57,4 +57,7 @@ export const serverConfig = {
 	sslKeyFile: process.env.SSL_KEY_FILE,
 	sslCertFile: process.env.SSL_CERT_FILE,
 	usbEnabled: process.env.USB_ENABLED !== "0",
+	// Optional: set to http://<esp32-ip> to drive the motor directly via ESP32 WiFi.
+	// When set, motor commands skip the phone WebSocket client entirely.
+	esp32Url: process.env.ESP32_URL ?? undefined,
 };

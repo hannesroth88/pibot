@@ -145,6 +145,7 @@ async function getUserRuntime(user: AuthenticatedUser): Promise<UserRuntime> {
 		localContextWindow: serverConfig.llamaContextWindow,
 		maxContextImages: serverConfig.maxContextImages,
 		robot,
+		esp32Url: serverConfig.esp32Url,
 		onEvent: async (event) => {
 			if (!runtime?.connected) return;
 			await handleHarnessEvent(runtime, event);
