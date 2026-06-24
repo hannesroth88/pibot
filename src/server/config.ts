@@ -60,4 +60,11 @@ export const serverConfig = {
 	// Optional: set to http://<esp32-ip> to drive the motor directly via ESP32 WiFi.
 	// When set, motor commands skip the phone WebSocket client entirely.
 	esp32Url: process.env.ESP32_URL ?? undefined,
+	// Optional: Home Assistant REST API. Both URL and token must be set to enable the tools.
+	homeAssistantUrl: process.env.HOME_ASSISTANT_URL ?? undefined,
+	homeAssistantToken: process.env.HOME_ASSISTANT_TOKEN ?? undefined,
+	homeAssistantAllowedDomains: (process.env.HOME_ASSISTANT_ALLOWED_DOMAINS ?? "light,switch,media_player,cover")
+		.split(",")
+		.map((domain) => domain.trim())
+		.filter((domain) => domain.length > 0),
 };
