@@ -78,6 +78,10 @@ interface SpotifySearchResponse {
 	audiobooks?: { items?: SpotifyNamedUri[] };
 }
 
+interface SpotifyPlaylistsResponse {
+	items?: SpotifyNamedUri[];
+}
+
 interface SpotifyPlaybackResponse {
 	is_playing?: boolean;
 	item?: SpotifyNamedUri | null;
@@ -207,7 +211,10 @@ function searchResultFromItem(item: SpotifyNamedUri): SpotifySearchResult {
 	return { ...nowPlayingFromItem(item), type: itemTypeFor(item), uri: item.uri };
 }
 
-function success(action: Exclude<SpotifyAction, "search">, playback?: SpotifyNowPlaying): SpotifyRpcResponse {
+function success(
+	action: Exclude<SpotifyAction, "search" | "list_devices" | "my_playlists">,
+	playback?: SpotifyNowPlaying,
+): SpotifyRpcResponse {
 	return {
 		ok: true,
 		action,
@@ -474,9 +481,15 @@ export function createSpotifyTool(deps: {
 		return (response?.[spotifySearchKey(itemType)]?.items ?? []).map(searchResultFromItem);
 	}
 
-	async function playUri(uri: string, signal?: AbortSignal): Promise<SpotifyNowPlaying> {
-		const deviceId = selectedDeviceId();
-		const suffix = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : "";
+	async function myPlaylists(limit: number, signal?: AbortSignal): Promise<SpotifySearchResult[]> {
+		const safeLimit = String(Math.max(1, Math.min(50, Math.floor(limit))));
+		const response = await api<SpotifyPlaylistsResponse>(`/me/playlists?limit=${safeLimit}`, {}, signal);
+		return (response?.items ?? []).map(searchResultFromItem);
+	}
+
+	async function playUri(uri: string, deviceId?: string, signal?: AbortSignal): Promise<SpotifyNowPlaying> {
+		const targetDevice = deviceId ?? selectedDeviceId();
+		const suffix = targetDevice ? `?device_id=${encodeURIComponent(targetDevice)}` : "";
 		const body =
 			uri.startsWith("spotify:track:") || uri.startsWith("spotify:episode:")
 				? { uris: [uri] }
@@ -504,11 +517,18 @@ export function createSpotifyTool(deps: {
 					results: await search(query, payload.itemType ?? "track", payload.limit ?? 5, signal),
 				};
 			}
+			if (payload.action === "list_devices") {
+				const fresh = await loadDevices(signal);
+				return { ok: true, action: "list_devices", devices: fresh };
+			}
+			if (payload.action === "my_playlists") {
+				return { ok: true, action: "my_playlists", results: await myPlaylists(payload.limit ?? 20, signal) };
+			}
 			if (payload.action === "play") {
 				const uri = payload.uri.trim();
 				if (!uri.startsWith("spotify:"))
-					throw new Error("Spotify play requires a spotify: URI from spotify_search");
-				return success("play", await playUri(uri, signal));
+					throw new Error("Spotify play requires a spotify: URI from spotify_search or spotify_my_playlists");
+				return success("play", await playUri(uri, payload.deviceId, signal));
 			}
 			if (payload.action === "pause") {
 				const deviceId = selectedDeviceId();

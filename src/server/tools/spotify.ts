@@ -24,8 +24,23 @@ const spotifySearchParameters = Type.Object({
 });
 
 const spotifyPlayParameters = Type.Object({
-	uri: Type.String({ description: "Exact spotify: URI returned by spotify_search." }),
+	uri: Type.String({ description: "Exact spotify: URI returned by spotify_search or spotify_my_playlists." }),
+	deviceId: Type.Optional(
+		Type.String({
+			description: "Spotify device ID from spotify_list_devices. Omit to use the currently active/selected device.",
+		}),
+	),
 });
+
+const spotifyMyPlaylistsParameters = Type.Object({
+	limit: Type.Optional(
+		Type.Number({
+			description: "Number of playlists to return. Default 20, maximum 50.",
+		}),
+	),
+});
+
+const spotifyListDevicesParameters = Type.Object({});
 
 const spotifyControlParameters = Type.Object({
 	action: StringEnum([...spotifyControlActions], {
@@ -45,7 +60,7 @@ function parseControlAction(value: string): SpotifyControlAction {
 }
 
 function summarizeResponse(result: Exclude<SpotifyRpcResponse, { ok: false }>): string {
-	if (result.action === "search") {
+	if (result.action === "search" || result.action === "my_playlists") {
 		if (result.results.length === 0) return "No Spotify results.";
 		return result.results
 			.map((entry, index) => {
@@ -54,18 +69,28 @@ function summarizeResponse(result: Exclude<SpotifyRpcResponse, { ok: false }>): 
 			})
 			.join("\n");
 	}
+	if (result.action === "list_devices") {
+		if (result.devices.length === 0) return "No Spotify devices available.";
+		return result.devices.map((d) => `${d.id} — ${d.name} (${d.type}${d.isActive ? ", active" : ""})`).join("\n");
+	}
 	const title = result.title ? ` ${result.title}` : "";
 	const subtitle = result.subtitle ? ` by ${result.subtitle}` : "";
 	const state = result.isPlaying === undefined ? "" : result.isPlaying ? " Playing." : " Paused.";
 	return `Spotify ${result.action}.${title}${subtitle}.${state}`.trim();
 }
 
-export function createSpotifyTools(robot: RobotClient): AgentTool[] {
+export function createSpotifyTools(robot: RobotClient, haRooms?: Record<string, string>): AgentTool[] {
+	const haRoomsEntries = Object.entries(haRooms ?? {});
+	const haRoomsKnown = haRoomsEntries.length > 0;
+	const haRoomsHint = haRoomsKnown
+		? ` Known rooms: ${haRoomsEntries.map(([name, entity]) => `${name} = ${entity}`).join(", ")}.`
+		: "";
+
 	const search: AgentTool<typeof spotifySearchParameters, SpotifyRpcResponse> = {
 		name: "spotify_search",
 		label: "Spotify Search",
 		description:
-			"Search Spotify. itemType must be one of: track, album, playlist, show, episode, audiobook. For podcasts use show; for podcast episodes use episode; never use podcast as an itemType. Request at least 5 results unless the user explicitly asks for fewer. Use this first when the requested item is ambiguous, then choose a returned spotify: URI for spotify_play.",
+			"Search Spotify. itemType must be one of: track, album, playlist, show, episode, audiobook. For podcasts use show; for podcast episodes use episode; never use podcast as an itemType. Request at least 5 results unless the user explicitly asks for fewer. For playlist requests, only use itemType=playlist here as a fallback after spotify_my_playlists returned no matching results.",
 		parameters: spotifySearchParameters,
 		executionMode: "sequential",
 		execute: async (_id, params, signal) => {
@@ -88,13 +113,51 @@ export function createSpotifyTools(robot: RobotClient): AgentTool[] {
 	const play: AgentTool<typeof spotifyPlayParameters, SpotifyRpcResponse> = {
 		name: "spotify_play",
 		label: "Spotify Play",
-		description: "Play an exact spotify: URI returned by spotify_search.",
+		description:
+			"Play an exact spotify: URI returned by spotify_search or spotify_my_playlists. If the user mentioned a room or device name (e.g. 'im Bad', 'in der Küche', 'im Wohnzimmer', 'on the speaker'), you MUST call spotify_list_devices first and pass the matching deviceId here. Never omit deviceId when a room or device was mentioned.",
 		parameters: spotifyPlayParameters,
 		executionMode: "sequential",
 		execute: async (_id, params, signal) => {
 			const result = await robot.execute({
 				type: "spotify",
-				payload: { action: "play", uri: params.uri },
+				payload: { action: "play", uri: params.uri, deviceId: params.deviceId },
+				timeoutMs: 15000,
+				signal,
+			});
+			if (!result.ok) throw new Error(result.error);
+			return { content: [{ type: "text", text: summarizeResponse(result) }], details: result };
+		},
+	};
+
+	const listDevices: AgentTool<typeof spotifyListDevicesParameters, SpotifyRpcResponse> = {
+		name: "spotify_list_devices",
+		label: "Spotify List Devices",
+		description: `List all available Spotify Connect devices. REQUIRED step before spotify_play whenever the user mentions a room or device name (e.g. 'im Bad', 'in der Küche', 'on the speaker', 'im Wohnzimmer'). Only use spotify_play with a deviceId if a listed device name clearly matches the room the user said. If no listed device matches — do NOT pick an arbitrary device — use homeassistant_call_service instead: domain=media_player, service=play_media, entity_id=<matching media_player entity>, data={ media_content_id: <spotify uri>, media_content_type: 'music' }.${haRoomsKnown ? ` Skip homeassistant_list_entities — use the known mapping directly.${haRoomsHint}` : " Use homeassistant_list_entities with domain=media_player to find the right entity id."}`,
+		parameters: spotifyListDevicesParameters,
+		executionMode: "sequential",
+		execute: async (_id, _params, signal) => {
+			const result = await robot.execute({
+				type: "spotify",
+				payload: { action: "list_devices" },
+				timeoutMs: 15000,
+				signal,
+			});
+			if (!result.ok) throw new Error(result.error);
+			return { content: [{ type: "text", text: summarizeResponse(result) }], details: result };
+		},
+	};
+
+	const myPlaylists: AgentTool<typeof spotifyMyPlaylistsParameters, SpotifyRpcResponse> = {
+		name: "spotify_my_playlists",
+		label: "Spotify My Playlists",
+		description:
+			"Fetch the current user's own Spotify playlists from their library. Always call this first for any playlist request before using spotify_search. If the desired playlist is found here, play it directly. Only fall back to spotify_search with itemType=playlist if no match is found in the results.",
+		parameters: spotifyMyPlaylistsParameters,
+		executionMode: "sequential",
+		execute: async (_id, params, signal) => {
+			const result = await robot.execute({
+				type: "spotify",
+				payload: { action: "my_playlists", limit: params.limit },
 				timeoutMs: 15000,
 				signal,
 			});
@@ -121,5 +184,5 @@ export function createSpotifyTools(robot: RobotClient): AgentTool[] {
 		},
 	};
 
-	return [search, play, control];
+	return [search, play, listDevices, myPlaylists, control];
 }

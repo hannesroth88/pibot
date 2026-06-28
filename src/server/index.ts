@@ -154,6 +154,7 @@ async function getUserRuntime(user: AuthenticatedUser): Promise<UserRuntime> {
 						allowedDomains: serverConfig.homeAssistantAllowedDomains,
 					}
 				: undefined,
+		spotifyHaRooms: serverConfig.spotifyHaRooms,
 		onEvent: async (event) => {
 			if (!runtime?.connected) return;
 			await handleHarnessEvent(runtime, event);

@@ -1,7 +1,15 @@
 export type MotorCommand = "forward" | "turn_left" | "turn_left_degrees" | "stop";
 
 export type SpotifyItemType = "track" | "album" | "playlist" | "audiobook" | "show" | "episode";
-export type SpotifyAction = "search" | "play" | "pause" | "resume" | "next" | "current";
+export type SpotifyAction =
+	| "search"
+	| "play"
+	| "pause"
+	| "resume"
+	| "next"
+	| "current"
+	| "list_devices"
+	| "my_playlists";
 export type SpotifyControlAction = "pause" | "resume" | "next" | "current";
 
 export interface SpotifyNowPlaying {
@@ -26,12 +34,16 @@ export interface SpotifyDeviceInfo {
 
 export type SpotifyRpcRequest =
 	| { action: "search"; query: string; itemType?: SpotifyItemType; limit?: number }
-	| { action: "play"; uri: string }
+	| { action: "play"; uri: string; deviceId?: string }
+	| { action: "my_playlists"; limit?: number }
+	| { action: "list_devices" }
 	| { action: SpotifyControlAction };
 
 export type SpotifyRpcResponse =
 	| { ok: true; action: "search"; results: SpotifySearchResult[] }
-	| ({ ok: true; action: Exclude<SpotifyAction, "search"> } & SpotifyNowPlaying)
+	| { ok: true; action: "my_playlists"; results: SpotifySearchResult[] }
+	| { ok: true; action: "list_devices"; devices: SpotifyDeviceInfo[] }
+	| ({ ok: true; action: Exclude<SpotifyAction, "search" | "my_playlists" | "list_devices"> } & SpotifyNowPlaying)
 	| { ok: false; error: string };
 
 export type LogOrigin = "server" | "client";

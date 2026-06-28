@@ -63,6 +63,16 @@ export const serverConfig = {
 	// Optional: Home Assistant REST API. Both URL and token must be set to enable the tools.
 	homeAssistantUrl: process.env.HOME_ASSISTANT_URL ?? undefined,
 	homeAssistantToken: process.env.HOME_ASSISTANT_TOKEN ?? undefined,
+	spotifyHaRooms: Object.fromEntries(
+		(process.env.SPOTIFY_HA_ROOMS ?? "")
+			.split(",")
+			.map((s) => s.trim())
+			.filter((s) => s.includes(":"))
+			.map((s) => {
+				const idx = s.indexOf(":");
+				return [s.slice(0, idx).trim(), s.slice(idx + 1).trim()] as [string, string];
+			}),
+	) as Record<string, string>,
 	homeAssistantAllowedDomains: (process.env.HOME_ASSISTANT_ALLOWED_DOMAINS ?? "light,switch,media_player,cover")
 		.split(",")
 		.map((domain) => domain.trim())

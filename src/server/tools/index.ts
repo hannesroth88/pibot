@@ -16,11 +16,12 @@ export function createRobotTools(
 	memoryStore: MemoryStore,
 	esp32Url?: string,
 	homeAssistant?: HomeAssistantConfig,
+	spotifyHaRooms?: Record<string, string>,
 ): AgentTool[] {
 	return [
 		...createMotorTools(robot, esp32Url),
 		createPhotoTool(robot),
-		...createSpotifyTools(robot),
+		...createSpotifyTools(robot, spotifyHaRooms),
 		...createHomeAssistantTools(homeAssistant),
 		sleepTool,
 		webSearchTool,
