@@ -79,11 +79,16 @@ function summarizeResponse(result: Exclude<SpotifyRpcResponse, { ok: false }>): 
 	return `Spotify ${result.action}.${title}${subtitle}.${state}`.trim();
 }
 
-export function createSpotifyTools(robot: RobotClient, haRooms?: Record<string, string>): AgentTool[] {
+export function createSpotifyTools(
+	robot: RobotClient,
+	haRooms?: Record<string, string>,
+	maConfigEntryId?: string,
+): AgentTool[] {
 	const haRoomsEntries = Object.entries(haRooms ?? {});
 	const haRoomsKnown = haRoomsEntries.length > 0;
+	const maHint = maConfigEntryId ? ` config_entry_id for music_assistant.search/get_library: ${maConfigEntryId}.` : "";
 	const haRoomsHint = haRoomsKnown
-		? ` Known rooms: ${haRoomsEntries.map(([name, entity]) => `${name} = ${entity}`).join(", ")}.`
+		? ` Room→entity map: ${haRoomsEntries.map(([name, entity]) => `${name}=${entity}`).join(", ")}. Room playback rules when a room or device name is mentioned: (1) Look up the entity_id from the map above. You MUST pass it as the top-level entity_id parameter to homeassistant_call_service (NOT inside data). Call homeassistant_call_service with domain=music_assistant, service=play_media, entity_id=<from map>, data={media_id:<name or spotify uri>, media_type:<type>, enqueue:play}. Passing the name directly is preferred; MA searches internally. (2) To pause a room speaker: homeassistant_call_service domain=media_player, service=media_pause, entity_id=<from map>. Use exactly 'media_pause'. (3) To move music between rooms: music_assistant.transfer_queue with entity_id=<new room>, data={source_player:<current room>}. (4) MA media_type: track, artist, album, playlist, radio, podcast, audiobook. Spotify show/episode→podcast. (5)${maHint}`
 		: "";
 
 	const search: AgentTool<typeof spotifySearchParameters, SpotifyRpcResponse> = {
@@ -114,7 +119,7 @@ export function createSpotifyTools(robot: RobotClient, haRooms?: Record<string, 
 		name: "spotify_play",
 		label: "Spotify Play",
 		description:
-			"Play an exact spotify: URI returned by spotify_search or spotify_my_playlists. If the user mentioned a room or device name (e.g. 'im Bad', 'in der Küche', 'im Wohnzimmer', 'on the speaker'), you MUST call spotify_list_devices first and pass the matching deviceId here. Never omit deviceId when a room or device was mentioned.",
+			"Play an exact spotify: URI on the currently active Spotify device. Use this only when no room or device name was mentioned. For room playback use homeassistant_call_service with music_assistant.play_media instead.",
 		parameters: spotifyPlayParameters,
 		executionMode: "sequential",
 		execute: async (_id, params, signal) => {
@@ -132,7 +137,7 @@ export function createSpotifyTools(robot: RobotClient, haRooms?: Record<string, 
 	const listDevices: AgentTool<typeof spotifyListDevicesParameters, SpotifyRpcResponse> = {
 		name: "spotify_list_devices",
 		label: "Spotify List Devices",
-		description: `List all available Spotify Connect devices. REQUIRED step before spotify_play whenever the user mentions a room or device name (e.g. 'im Bad', 'in der Küche', 'on the speaker', 'im Wohnzimmer'). Only use spotify_play with a deviceId if a listed device name clearly matches the room the user said. If no listed device matches — do NOT pick an arbitrary device — use homeassistant_call_service instead: domain=media_player, service=play_media, entity_id=<matching media_player entity>, data={ media_content_id: <spotify uri>, media_content_type: 'music' }.${haRoomsKnown ? ` Skip homeassistant_list_entities — use the known mapping directly.${haRoomsHint}` : " Use homeassistant_list_entities with domain=media_player to find the right entity id."}`,
+		description: `List available Spotify Connect devices. Call this only when no room was mentioned and you need to find the active device, or when the user mentions a room not in the known rooms map.${haRoomsHint}${haRoomsKnown ? " If the user mentions a room not in the known rooms map, do NOT guess an entity ID — instead tell the user the room is unknown and list the known rooms." : " For unknown rooms: if device not listed use homeassistant_list_entities with domain=media_player then homeassistant_call_service with music_assistant.play_media."}`,
 		parameters: spotifyListDevicesParameters,
 		executionMode: "sequential",
 		execute: async (_id, _params, signal) => {

@@ -155,6 +155,7 @@ async function getUserRuntime(user: AuthenticatedUser): Promise<UserRuntime> {
 					}
 				: undefined,
 		spotifyHaRooms: serverConfig.spotifyHaRooms,
+		maConfigEntryId: serverConfig.maConfigEntryId,
 		onEvent: async (event) => {
 			if (!runtime?.connected) return;
 			await handleHarnessEvent(runtime, event);

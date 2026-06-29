@@ -68,7 +68,7 @@ async function haRequest(
 				"content-type": "application/json",
 			},
 			body: init?.body === undefined ? undefined : JSON.stringify(init.body),
-			signal: AbortSignal.timeout(15000),
+			signal: AbortSignal.timeout(30000),
 		});
 	} catch (error) {
 		const cause = error instanceof Error ? error.message : String(error);

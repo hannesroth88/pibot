@@ -73,6 +73,7 @@ export const serverConfig = {
 				return [s.slice(0, idx).trim(), s.slice(idx + 1).trim()] as [string, string];
 			}),
 	) as Record<string, string>,
+	maConfigEntryId: process.env.MA_CONFIG_ENTRY_ID ?? undefined,
 	homeAssistantAllowedDomains: (process.env.HOME_ASSISTANT_ALLOWED_DOMAINS ?? "light,switch,media_player,cover")
 		.split(",")
 		.map((domain) => domain.trim())
