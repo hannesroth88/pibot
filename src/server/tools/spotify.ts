@@ -79,18 +79,7 @@ function summarizeResponse(result: Exclude<SpotifyRpcResponse, { ok: false }>): 
 	return `Spotify ${result.action}.${title}${subtitle}.${state}`.trim();
 }
 
-export function createSpotifyTools(
-	robot: RobotClient,
-	haRooms?: Record<string, string>,
-	maConfigEntryId?: string,
-): AgentTool[] {
-	const haRoomsEntries = Object.entries(haRooms ?? {});
-	const haRoomsKnown = haRoomsEntries.length > 0;
-	const maHint = maConfigEntryId ? ` config_entry_id for music_assistant.search/get_library: ${maConfigEntryId}.` : "";
-	const haRoomsHint = haRoomsKnown
-		? ` Room→entity map: ${haRoomsEntries.map(([name, entity]) => `${name}=${entity}`).join(", ")}. Room playback rules when a room or device name is mentioned: (1) Look up the entity_id from the map above. You MUST pass it as the top-level entity_id parameter to homeassistant_call_service (NOT inside data). Call homeassistant_call_service with domain=music_assistant, service=play_media, entity_id=<from map>, data={media_id:<name or spotify uri>, media_type:<type>, enqueue:play}. Passing the name directly is preferred; MA searches internally. (2) To pause a room speaker: homeassistant_call_service domain=media_player, service=media_pause, entity_id=<from map>. Use exactly 'media_pause'. (3) To move music between rooms: music_assistant.transfer_queue with entity_id=<new room>, data={source_player:<current room>}. (4) MA media_type: track, artist, album, playlist, radio, podcast, audiobook. Spotify show/episode→podcast. (5)${maHint}`
-		: "";
-
+export function createSpotifyTools(robot: RobotClient): AgentTool[] {
 	const search: AgentTool<typeof spotifySearchParameters, SpotifyRpcResponse> = {
 		name: "spotify_search",
 		label: "Spotify Search",
@@ -137,7 +126,8 @@ export function createSpotifyTools(
 	const listDevices: AgentTool<typeof spotifyListDevicesParameters, SpotifyRpcResponse> = {
 		name: "spotify_list_devices",
 		label: "Spotify List Devices",
-		description: `List available Spotify Connect devices. Call this only when no room was mentioned and you need to find the active device, or when the user mentions a room not in the known rooms map.${haRoomsHint}${haRoomsKnown ? " If the user mentions a room not in the known rooms map, do NOT guess an entity ID — instead tell the user the room is unknown and list the known rooms." : " For unknown rooms: if device not listed use homeassistant_list_entities with domain=media_player then homeassistant_call_service with music_assistant.play_media."}`,
+		description:
+			"List available Spotify Connect devices. Call this only when no room was mentioned and you need to find the active device.",
 		parameters: spotifyListDevicesParameters,
 		executionMode: "sequential",
 		execute: async (_id, _params, signal) => {

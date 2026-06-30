@@ -4,6 +4,7 @@ import { createHomeAssistantTools, type HomeAssistantConfig } from "./homeassist
 import type { MemoryStore } from "./memory.js";
 import { createMemoryTool } from "./memory.js";
 import { createMotorTools } from "./motor.js";
+import { createMusicAssistantTools } from "./music-assistant.js";
 import { createPhotoTool } from "./photo.js";
 import { sleepTool } from "./sleep.js";
 import { createSpotifyTools } from "./spotify.js";
@@ -17,12 +18,12 @@ export function createRobotTools(
 	esp32Url?: string,
 	homeAssistant?: HomeAssistantConfig,
 	spotifyHaRooms?: Record<string, string>,
-	maConfigEntryId?: string,
 ): AgentTool[] {
 	return [
 		...createMotorTools(robot, esp32Url),
 		createPhotoTool(robot),
-		...createSpotifyTools(robot, spotifyHaRooms, maConfigEntryId),
+		...createSpotifyTools(robot),
+		...createMusicAssistantTools(homeAssistant, spotifyHaRooms),
 		...createHomeAssistantTools(homeAssistant),
 		sleepTool,
 		webSearchTool,

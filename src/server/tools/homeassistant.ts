@@ -53,7 +53,7 @@ function friendlyName(state: HomeAssistantState): string {
 	return typeof name === "string" && name.length > 0 ? name : state.entity_id;
 }
 
-async function haRequest(
+export async function haRequest(
 	config: HomeAssistantConfig,
 	path: string,
 	init?: { method?: string; body?: unknown },
